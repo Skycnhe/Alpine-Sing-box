@@ -174,6 +174,9 @@ select_core_asset() {
 install_core() {
     step "安装 sing-box 核心"
 
+    # 确保目录存在 (install_core 可能在 install_configs 之前独立调用)
+    mkdir -p "$SB_DIR" "$LOG_DIR"
+
     local goarch libc
     goarch="$(detect_arch)"
     libc="$(detect_libc)"
