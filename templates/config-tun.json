@@ -1,6 +1,4 @@
 {
-  "_comment": "sing-box TUN 透明网关模板 - 旁路由模式 (自动路由, 无需 nftables/iptables) [sing-box 1.12+ 新格式]",
-  "_usage": "sing-box 自带 auto_route + strict_route, 无需手动配置防火墙规则。含防DNS泄露(fakeip) + 国内外分流(geosite/geoip)。",
   "log": {
     "disabled": false,
     "level": "info",

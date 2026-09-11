@@ -1,6 +1,4 @@
 {
-  "_comment": "sing-box Mixed 客户端模式模板 - 仅 HTTP/SOCKS 代理, 不做透明网关 [sing-box 1.12+ 新格式]",
-  "_usage": "适合在设备上单独运行, 其他设备手动设置代理指向此端口。含防DNS泄露(fakeip) + 国内外分流(geosite/geoip)。",
   "log": {
     "disabled": false,
     "level": "info",

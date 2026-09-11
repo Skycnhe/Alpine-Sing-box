@@ -1,6 +1,4 @@
 {
-  "_comment": "sing-box tproxy 透明网关模板 - 旁路由模式 (nftables redirect) [sing-box 1.12+ 新格式]",
-  "_usage": "配合 nftables 规则使用。含防DNS泄露(fakeip) + 国内外分流(geosite/geoip)。转换订阅时自动注入增强规则。",
   "log": {
     "disabled": false,
     "level": "info",

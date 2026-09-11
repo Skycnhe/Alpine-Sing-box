@@ -261,15 +261,36 @@ install_configs() {
         cp -f "${SCRIPT_DIR}"/templates/config-*.json "$SB_TEMPLATES_DIR/"
     fi
 
-    # 初始化配置 (如不存在)
+    # 初始化配置
+    local need_regen=false
     if [ ! -f "$SB_CONFIG" ]; then
         info "创建默认配置 (tproxy 模式)..."
-        cp "${SB_TEMPLATES_DIR}/config-tproxy.json" "$SB_CONFIG"
-        # 去掉注释字段
-        jq 'del(._comment, ._usage)' "$SB_CONFIG" > "$SB_CONFIG.tmp" && mv "$SB_CONFIG.tmp" "$SB_CONFIG"
+        need_regen=true
     else
-        info "配置文件已存在, 保留现有配置"
-        cp "$SB_CONFIG" "$SB_CONFIG_BACKUP"
+        # 检测旧格式: legacy DNS (address 字段) 或 _comment 字段
+        if grep -q '"_comment"\|"_usage"\|"address".*dns-query\|"address".*rcode' "$SB_CONFIG" 2>/dev/null; then
+            warn "检测到旧格式配置 (legacy DNS / 注释字段), 自动迁移到新格式..."
+            cp "$SB_CONFIG" "${SB_CONFIG_BACKUP}.old-format"
+            need_regen=true
+        else
+            info "配置文件已存在, 保留现有配置"
+            cp "$SB_CONFIG" "$SB_CONFIG_BACKUP"
+        fi
+    fi
+
+    if [ "$need_regen" = true ]; then
+        cp "${SB_TEMPLATES_DIR}/config-tproxy.json" "$SB_CONFIG"
+        # 去掉所有 _ 开头的注释字段 (模板已无注释, 此为安全兜底)
+        if command -v jq >/dev/null 2>&1; then
+            jq 'with_entries(select(.key[0:1] != "_"))' "$SB_CONFIG" > "$SB_CONFIG.tmp" 2>/dev/null && mv "$SB_CONFIG.tmp" "$SB_CONFIG" || true
+        elif command -v python3 >/dev/null 2>&1; then
+            python3 -c "
+import json
+with open('$SB_CONFIG') as f: d=json.load(f)
+d={k:v for k,v in d.items() if not k.startswith('_')}
+with open('$SB_CONFIG','w') as f: json.dump(d,f,indent=2,ensure_ascii=False)
+" 2>/dev/null || true
+        fi
     fi
 
     # 初始化订阅文件
@@ -294,6 +315,116 @@ EOF
     info "  核心配置: ${SB_CONFIG}"
     info "  模板目录: ${SB_TEMPLATES_DIR}"
     info "  订阅文件: ${SUBS_FILE}"
+}
+
+# ==================== 修复/迁移配置 ====================
+fix_config() {
+    step "检测并修复 sing-box 配置"
+
+    mkdir -p "$SB_DIR" "$SB_TEMPLATES_DIR"
+
+    # 确保模板存在
+    if [ ! -f "${SB_TEMPLATES_DIR}/config-tproxy.json" ] && [ -d "${SCRIPT_DIR}/templates" ]; then
+        info "安装模板文件..."
+        cp -f "${SCRIPT_DIR}"/templates/config-*.json "$SB_TEMPLATES_DIR/"
+    fi
+
+    if [ ! -f "$SB_CONFIG" ]; then
+        warn "config.json 不存在, 从 tproxy 模板创建..."
+        cp "${SB_TEMPLATES_DIR}/config-tproxy.json" "$SB_CONFIG"
+    fi
+
+    local need_fix=false
+
+    # 检测问题: _comment/_usage 字段, legacy DNS (address + dns-query/rcode)
+    if grep -qE '"_(comment|usage)"' "$SB_CONFIG" 2>/dev/null; then
+        warn "检测到注释字段 (_comment/_usage) — sing-box 会拒绝未知字段"
+        need_fix=true
+    fi
+    if grep -qE '"address"\s*:\s*"(https?://|rcode://)' "$SB_CONFIG" 2>/dev/null; then
+        warn "检测到 legacy DNS 格式 (address + dns-query/rcode) — sing-box 1.14.0 已移除"
+        need_fix=true
+    fi
+    if grep -q '"independent_cache"' "$SB_CONFIG" 2>/dev/null; then
+        warn "检测到 independent_cache — sing-box 1.14.0 已移除"
+        need_fix=true
+    fi
+    if grep -qE '"type"\s*:\s*"block"|"type"\s*:\s*"dns"' "$SB_CONFIG" 2>/dev/null; then
+        warn "检测到 block/dns outbound — sing-box 1.14.0 已改为 route action"
+        need_fix=true
+    fi
+
+    if [ "$need_fix" = false ]; then
+        info "${GREEN}配置格式正常, 无需修复${NC}"
+        # 仍然清理可能的 _ 字段 (安全兜底)
+        if command -v jq >/dev/null 2>&1; then
+            jq 'with_entries(select(.key[0:1] != "_"))' "$SB_CONFIG" > "$SB_CONFIG.tmp" 2>/dev/null && mv "$SB_CONFIG.tmp" "$SB_CONFIG"
+        fi
+        return 0
+    fi
+
+    # 备份旧配置
+    local bak="${SB_CONFIG}.fix-bak.$(date +%s)"
+    cp "$SB_CONFIG" "$bak"
+    info "已备份旧配置到: ${bak}"
+
+    # 从 tproxy 模板重新生成 (保留旧配置的出站节点)
+    local tpl="${SB_TEMPLATES_DIR}/config-tproxy.json"
+    if [ ! -f "$tpl" ]; then
+        error "模板不存在, 无法修复. 请先运行: sb --install"
+        return 1
+    fi
+
+    # 提取旧配置中的代理节点 (非 direct/block/dns/selector/urltest 的出站)
+    local nodes_file="/tmp/sb-nodes-$$.json"
+    if command -v jq >/dev/null 2>&1; then
+        jq '[.outbounds[] | select(.type | test("direct|block|dns|selector|urltest|reject") | not)]' \
+           "$SB_CONFIG" > "$nodes_file" 2>/dev/null || echo '[]' > "$nodes_file"
+    else
+        echo '[]' > "$nodes_file"
+    fi
+
+    # 用新模板 + 旧节点重建 (通过面板 API 或直接 jq 合并)
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c "
+import json
+with open('$tpl') as f: tpl_cfg = json.load(f)
+tpl_cfg = {k:v for k,v in tpl_cfg.items() if not k.startswith('_')}
+with open('$nodes_file') as f: nodes = json.load(f)
+if nodes:
+    # 重建出站: select + auto + 节点 + direct
+    ob = [{'tag':'select','type':'selector','outbounds':[n['tag'] for n in nodes]+['direct'],'default':nodes[0]['tag']}]
+    ob += nodes
+    ob += [{'tag':'direct','type':'direct'}]
+    tpl_cfg['outbounds'] = ob
+    # select 引用加入路由
+    if 'route' in tpl_cfg:
+        tpl_cfg['route']['final'] = 'select'
+with open('$SB_CONFIG','w') as f: json.dump(tpl_cfg,f,indent=2,ensure_ascii=False)
+" 2>/dev/null
+        info "${GREEN}配置已从新模板重建 (保留旧节点)${NC}"
+    else
+        # 无 python3: 直接用模板
+        jq 'with_entries(select(.key[0:1] != "_"))' "$tpl" > "$SB_CONFIG" 2>/dev/null \
+            || cp "$tpl" "$SB_CONFIG"
+        info "${GREEN}配置已从新模板重建 (未保留旧节点, 无 python3)${NC}"
+    fi
+
+    rm -f "$nodes_file"
+
+    # 校验
+    if [ -x "$SB_BIN" ]; then
+        info "校验配置..."
+        if "$SB_BIN" check -c "$SB_CONFIG" 2>&1; then
+            info "${GREEN}配置校验通过${NC}"
+        else
+            warn "配置校验仍有问题, 请检查日志"
+            return 1
+        fi
+    fi
+
+    info "${GREEN}配置修复完成${NC}"
+    info "如需重启: rc-service sing-box restart"
 }
 
 # ==================== 下载/安装管理面板 ====================
@@ -1059,9 +1190,14 @@ menu_setup_gateway() {
                 fi
                 info "切换到 ${tpl} 模式 (备份当前配置)"
                 [ -f "$SB_CONFIG" ] && cp "$SB_CONFIG" "$SB_CONFIG_BACKUP"
-                jq 'del(._comment,._usage,_usage_tproxy,_usage_tun,_usage_mixed)' \
-                   "${SB_TEMPLATES_DIR}/config-${tpl}.json" > "$SB_CONFIG" 2>/dev/null \
-                   || cp "${SB_TEMPLATES_DIR}/config-${tpl}.json" "$SB_CONFIG"
+                # 复制模板并去除所有 _ 开头字段 (模板本身已无注释, 此为安全兜底)
+                if command -v jq >/dev/null 2>&1; then
+                    jq 'with_entries(select(.key[0:1] != "_"))' \
+                       "${SB_TEMPLATES_DIR}/config-${tpl}.json" > "$SB_CONFIG" 2>/dev/null \
+                       || cp "${SB_TEMPLATES_DIR}/config-${tpl}.json" "$SB_CONFIG"
+                else
+                    cp "${SB_TEMPLATES_DIR}/config-${tpl}.json" "$SB_CONFIG"
+                fi
                 # 记录模式
                 if [ -f "$PANEL_CONFIG" ]; then
                     jq --arg m "$tpl" '.gateway_mode=$m' "$PANEL_CONFIG" > "$PANEL_CONFIG.tmp" && mv "$PANEL_CONFIG.tmp" "$PANEL_CONFIG"
@@ -1170,9 +1306,10 @@ main_menu() {
         echo " 10)  查看日志"
         echo " 11)  卸载"
         echo " 12)  安装快捷命令 sb  (安装后直接输入 sb 打开菜单)"
+        echo " 13)  修复/迁移配置  (旧格式DNS/_comment → 新格式)"
         echo "  0)  退出"
         echo ""
-        read -r -p "请选择 [0-12]: " choice
+        read -r -p "请选择 [0-13]: " choice
         case "$choice" in
             1)  full_install ;;
             2)  do_update_core ;;
@@ -1186,6 +1323,7 @@ main_menu() {
             10) show_logs ;;
             11) do_uninstall ;;
             12) install_shortcut ;;
+            13) fix_config ;;
             0|"") echo "再见"; exit 0 ;;
             *) warn "无效选项: $choice" ;;
         esac
@@ -1206,6 +1344,7 @@ main() {
         --convert)      do_convert "${2:-}" "${3:-tproxy}" ;;
         --convert-apply) do_convert_apply "${2:-}" "${3:-tproxy}" ;;
         --install-shortcut) install_shortcut ;;
+        --fix-config)   fix_config ;;
         --status)       show_info ;;
         --uninstall)    do_uninstall ;;
         --help|-h)
@@ -1220,6 +1359,7 @@ sing-box 旁路由网关部署脚本 (Alpine Linux)
   sb --install                    完整部署
   sb --update-core                更新核心
   sb --convert-apply <URL>        转换并应用订阅
+  sb --fix-config                 修复/迁移旧格式配置 (legacy DNS / _comment)
   sb --help                       查看帮助
   bash $0                         交互式菜单 (默认)
   bash $0 --menu                  交互式菜单
@@ -1232,6 +1372,7 @@ sing-box 旁路由网关部署脚本 (Alpine Linux)
   bash $0 --convert-apply <URL> [模板]  转换订阅并直接写入 config.json + 重启
                                   模板: tproxy / tun / mixed
   bash $0 --install-shortcut      安装 sb 快捷命令到 /usr/local/bin/sb
+  bash $0 --fix-config            修复/迁移旧格式配置
   bash $0 --status                查看当前配置与状态
   bash $0 --uninstall             卸载 (交互式确认)
   bash $0 --help                  显示此帮助
@@ -1239,7 +1380,7 @@ sing-box 旁路由网关部署脚本 (Alpine Linux)
 菜单功能 (交互模式):
   1 完整安装  2 更新核心  3 更新面板  4 更新订阅  5 转换订阅(预览/应用)
   6 服务管理  7 配置网关  8 面板管理  9 查看信息  10 查看日志  11 卸载
-  12 安装快捷命令 sb
+  12 安装快捷命令 sb  13 修复/迁移配置
 
 模板说明:
   config-tproxy.json  tproxy 透明网关 (需 nftables 规则, 推荐旁路由)
