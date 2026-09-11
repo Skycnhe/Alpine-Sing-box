@@ -896,6 +896,348 @@ def _parse_bw(val):
     return int(m.group(1)) if m else 0
 
 
+# ============================================================
+# 防DNS泄露 + 国内外分流规则构建
+# ============================================================
+
+def extract_proxy_domains(outbounds):
+    """从节点列表中提取代理服务器域名 (非IP) → 用于防DNS泄露规则
+
+    代理服务器自身的域名必须走直连DNS解析, 否则会形成循环依赖:
+    解析代理域名→走代理DNS→代理DNS要通过代理→代理域名还没解析→死循环
+    """
+    domains = set()
+    ip_re = re.compile(r'^(\d{1,3}\.){3}\d{1,3}$')
+    for ob in outbounds:
+        server = ob.get("server", "")
+        if server and not ip_re.match(server):
+            domains.add(server)
+    return sorted(domains) if domains else None
+
+
+def build_anti_leak_dns(proxy_domains=None):
+    """构建防DNS泄露 DNS 配置 (sing-box 1.12+ 新格式)
+
+    防泄露策略:
+    1. 代理服务器域名 → 直连DNS (防止循环依赖)
+    2. 广告域名 → REFUSED (DNS层拦截)
+    3. clash_mode直连 → 直连DNS
+    4. clash_mode全局 → 代理DNS
+    5. 国内域名 → 直连DNS (CDN优化, 走国内DNS更快)
+    6. 其他所有A/AAAA查询 → fakeip (彻底防泄露: 返回假IP, 真实DNS在代理端解析)
+    7. 兜底 → 代理DNS (DoH走代理, ISP看不到DNS查询)
+    """
+    servers = [
+        {
+            "type": "https",
+            "tag": "proxy-dns",
+            "server": "1.1.1.1",
+            "detour": "select"
+        },
+        {
+            "type": "udp",
+            "tag": "direct-dns",
+            "server": "223.5.5.5",
+            "detour": "direct"
+        },
+        {
+            "type": "fakeip",
+            "tag": "fakeip-dns",
+            "inet4_range": "198.18.0.0/15"
+        }
+    ]
+
+    rules = []
+
+    # 规则1: 代理服务器域名 → 直连DNS (防循环依赖, 必须第一条)
+    if proxy_domains:
+        rules.append({
+            "domain": proxy_domains,
+            "action": "route",
+            "server": "direct-dns"
+        })
+
+    # 规则2: 广告域名 → DNS层拒绝
+    rules.append({
+        "rule_set": "geosite-category-ads-all",
+        "rcode": "REFUSED"
+    })
+
+    # 规则3: clash_mode 直连 → 直连DNS
+    rules.append({
+        "clash_mode": "direct",
+        "action": "route",
+        "server": "direct-dns"
+    })
+
+    # 规则4: clash_mode 全局 → 代理DNS
+    rules.append({
+        "clash_mode": "global",
+        "action": "route",
+        "server": "proxy-dns"
+    })
+
+    # 规则5: 国内域名 → 直连DNS (CDN优化)
+    rules.append({
+        "rule_set": "geosite-cn",
+        "action": "route",
+        "server": "direct-dns"
+    })
+
+    # 规则6: 其他所有A/AAAA查询 → fakeip (核心防泄露)
+    rules.append({
+        "query_type": ["A", "AAAA"],
+        "action": "route",
+        "server": "fakeip-dns"
+    })
+
+    return {
+        "servers": servers,
+        "rules": rules,
+        "final": "proxy-dns",
+        "strategy": "ipv4_only",
+        "reverse_mapping": True,
+        "disable_cache": False,
+        "disable_expire": False
+    }
+
+
+def build_geo_route_config():
+    """构建国内外分流路由配置 (sing-box 1.12+ 新格式)
+
+    分流策略:
+    1. 嗅探协议 → 获取域名 (配合fakeip实现域名路由)
+    2. 劫持DNS → 所有DNS查询交给sing-box处理 (fakeip必需)
+    3. clash_mode 支持
+    4. 广告 → 拒绝 (路由层拦截)
+    5. 国外服务 (Google/Telegram/YouTube/Netflix/GitHub) → 代理
+    6. 国内域名+IP → 直连
+    7. 私有IP → 直连
+    8. 兜底 → 代理 (未匹配的全部走代理)
+    """
+    rules = [
+        # 嗅探协议 (从连接中提取域名, 配合fakeip的reverse_mapping)
+        {"action": "sniff"},
+        # 劫持所有DNS查询 (fakeip工作前提: DNS必须经过sing-box)
+        {"protocol": "dns", "action": "hijack-dns"},
+        # clash_mode 支持
+        {"clash_mode": "direct", "outbound": "direct"},
+        {"clash_mode": "global", "outbound": "select"},
+        # 广告拦截
+        {"rule_set": "geosite-category-ads-all", "action": "reject"},
+        # 国外服务 → 强制走代理 (在国内域名规则之前, 确保不被误判为直连)
+        {
+            "rule_set": [
+                "geosite-google",
+                "geosite-telegram",
+                "geosite-youtube",
+                "geosite-netflix",
+                "geosite-github"
+            ],
+            "outbound": "select"
+        },
+        # 国内域名 + 国内IP → 直连
+        {
+            "rule_set": ["geosite-cn", "geoip-cn"],
+            "outbound": "direct"
+        },
+        # 私有/本地IP → 直连
+        {"ip_is_private": True, "outbound": "direct"}
+    ]
+
+    rule_sets = [
+        {
+            "tag": "geosite-cn",
+            "type": "remote",
+            "format": "binary",
+            "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs",
+            "download_detour": "select"
+        },
+        {
+            "tag": "geoip-cn",
+            "type": "remote",
+            "format": "binary",
+            "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs",
+            "download_detour": "select"
+        },
+        {
+            "tag": "geosite-category-ads-all",
+            "type": "remote",
+            "format": "binary",
+            "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ads-all.srs",
+            "download_detour": "select"
+        },
+        {
+            "tag": "geosite-google",
+            "type": "remote",
+            "format": "binary",
+            "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-google.srs",
+            "download_detour": "select"
+        },
+        {
+            "tag": "geosite-telegram",
+            "type": "remote",
+            "format": "binary",
+            "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-telegram.srs",
+            "download_detour": "select"
+        },
+        {
+            "tag": "geosite-youtube",
+            "type": "remote",
+            "format": "binary",
+            "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-youtube.srs",
+            "download_detour": "select"
+        },
+        {
+            "tag": "geosite-netflix",
+            "type": "remote",
+            "format": "binary",
+            "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-netflix.srs",
+            "download_detour": "select"
+        },
+        {
+            "tag": "geosite-github",
+            "type": "remote",
+            "format": "binary",
+            "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-github.srs",
+            "download_detour": "select"
+        }
+    ]
+
+    return {
+        "rules": rules,
+        "rule_set": rule_sets,
+        "auto_detect_interface": True,
+        "final": "select",
+        "default_domain_resolver": {
+            "server": "direct-dns"
+        }
+    }
+
+
+# ============================================================
+# Clash proxy-groups → sing-box selector/urltest 转换
+# ============================================================
+
+def parse_clash_proxy_groups(clash_groups, node_tags):
+    """转换 Clash proxy-groups → sing-box selector/urltest outbounds
+
+    支持: select / url-test / fallback / load-balance
+    映射: DIRECT → direct, REJECT → 跳过(由路由规则处理)
+    解析: 代理组间引用 (如"节点选择"引用"自动选择")
+    """
+    group_tags = [str(g.get("name", "")) for g in clash_groups if g.get("name")]
+    sg_groups = []
+
+    for g in clash_groups:
+        gname = str(g.get("name", ""))
+        if not gname:
+            continue
+        gtype = (g.get("type") or "").lower()
+        proxies = g.get("proxies", [])
+
+        # 映射 Clash 代理名称 → sing-box tag
+        outbound_tags = []
+        for p in proxies:
+            p = str(p)
+            if p == "DIRECT":
+                outbound_tags.append("direct")
+            elif p == "REJECT":
+                continue  # 跳过, 由路由规则 action:reject 处理
+            elif p in node_tags or p in group_tags:
+                outbound_tags.append(p)
+            # else: 未知代理, 跳过
+
+        if gtype == "select":
+            sg_groups.append({
+                "tag": gname,
+                "type": "selector",
+                "outbounds": outbound_tags if outbound_tags else ["direct"],
+                "default": outbound_tags[0] if outbound_tags else "direct"
+            })
+        elif gtype in ("url-test", "fallback", "load-balance"):
+            url = g.get("url", "https://www.gstatic.com/generate_204")
+            interval = g.get("interval", 300)
+            if isinstance(interval, (int, float)):
+                interval = f"{int(interval)}s"
+            entry = {
+                "tag": gname,
+                "type": "urltest",
+                "outbounds": [t for t in outbound_tags if t != "direct"] or ["direct"],
+                "url": url,
+                "interval": str(interval),
+                "tolerance": int(g.get("tolerance", 50))
+            }
+            sg_groups.append(entry)
+
+    return sg_groups
+
+
+def parse_clash_yaml_full(text):
+    """完整解析 Clash YAML → {outbounds, proxy_groups, rules}
+
+    相比 parse_clash_yaml (仅返回 outbounds), 此函数额外解析:
+    - proxy-groups → sing-box selector/urltest
+    - rules → Clash 路由规则 (供参考)
+    """
+    if not yaml:
+        return {"outbounds": [], "proxy_groups": [], "rules": []}
+    try:
+        data = yaml.safe_load(text)
+    except Exception:
+        return {"outbounds": [], "proxy_groups": [], "rules": []}
+
+    outbounds = parse_clash_yaml(text)
+    node_tags = [n["tag"] for n in outbounds]
+
+    clash_groups = data.get("proxy-groups") or []
+    proxy_groups = parse_clash_proxy_groups(clash_groups, node_tags)
+
+    clash_rules = data.get("rules") or []
+
+    return {
+        "outbounds": outbounds,
+        "proxy_groups": proxy_groups,
+        "rules": clash_rules,
+    }
+
+
+def merge_nodes_with_groups(config, nodes, proxy_groups):
+    """合并节点 + Clash代理组到配置中
+
+    输出结构: select → 代理组(selector/urltest) → 节点 → direct
+    select 引用第一个 selector 代理组, 兜底 direct
+    """
+    group_tags = [g["tag"] for g in proxy_groups]
+
+    # 第一个 selector 类型的代理组作为 select 默认值
+    first_selector = next(
+        (g["tag"] for g in proxy_groups if g.get("type") == "selector"),
+        group_tags[0] if group_tags else "direct"
+    )
+
+    # 构建 select 出站
+    select_outbound = {
+        "tag": "select",
+        "type": "selector",
+        "outbounds": group_tags + ["direct"] if group_tags else ["direct"],
+        "default": first_selector
+    }
+
+    # 保留模板的 direct
+    direct_outbounds = [
+        o for o in config.get("outbounds", [])
+        if o.get("tag") == "direct" and o.get("type") == "direct"
+    ]
+    if not direct_outbounds:
+        direct_outbounds = [{"tag": "direct", "type": "direct"}]
+
+    # 组装: select → 代理组 → 节点 → direct
+    config["outbounds"] = [select_outbound] + proxy_groups + nodes + direct_outbounds
+
+    return config
+
+
 def parse_subscription(text):
     """
     自动识别订阅格式并解析为 sing-box outbounds 列表
@@ -1033,8 +1375,14 @@ def validate_config(config_path):
     return False, err or out or "配置校验失败"
 
 
-def build_full_config_from_nodes(nodes, template_name="tproxy"):
-    """从节点列表 + 模板构建完整 sing-box 配置"""
+def build_full_config_from_nodes(nodes, template_name="tproxy", clash_full=None):
+    """从节点列表 + 模板构建完整 sing-box 配置 (含防DNS泄露 + 国内外分流)
+
+    自动注入:
+    1. 防DNS泄露 DNS 配置 (fakeip + 国内外分流DNS + 代理服务器域名防循环)
+    2. 国内外分流路由规则 (geosite-cn/geoip-cn 直连, 国外服务走代理)
+    3. 如有 Clash proxy-groups, 转换为 sing-box selector/urltest
+    """
     template_path = os.path.join(TEMPLATE_DIR, f"config-{template_name}.json")
     if not os.path.exists(template_path):
         template_path = os.path.join(TEMPLATE_DIR, "config-tproxy.json")
@@ -1046,7 +1394,33 @@ def build_full_config_from_nodes(nodes, template_name="tproxy"):
             config = json.load(f)
     # 清理注释字段
     config = {k: v for k, v in config.items() if not k.startswith("_")}
-    return merge_nodes_into_config(config, nodes)
+
+    # 节点去重 (按 tag)
+    seen = set()
+    unique_nodes = []
+    for n in nodes:
+        tag = n.get("tag", "")
+        if tag and tag not in seen:
+            seen.add(tag)
+            unique_nodes.append(n)
+    nodes = unique_nodes
+
+    # 提取代理服务器域名 (防DNS泄露: 代理服务器域名必须走直连DNS)
+    proxy_domains = extract_proxy_domains(nodes)
+
+    # 注入防DNS泄露 DNS 配置 (覆盖模板的 DNS)
+    config["dns"] = build_anti_leak_dns(proxy_domains)
+
+    # 注入国内外分流路由规则 (覆盖模板的 route)
+    config["route"] = build_geo_route_config()
+
+    # 合并节点 + 代理组
+    if clash_full and clash_full.get("proxy_groups"):
+        config = merge_nodes_with_groups(config, nodes, clash_full["proxy_groups"])
+    else:
+        config = merge_nodes_into_config(config, nodes)
+
+    return config
 
 
 # ============================================================
@@ -1148,25 +1522,35 @@ def api_del_sub(name):
 
 @app.route("/api/subscriptions/update", methods=["POST"])
 def api_update_subs():
-    """拉取所有订阅, 合并节点, 更新 config.json, 重启 sing-box"""
+    """拉取所有订阅, 合并节点, 更新 config.json (含防DNS泄露+国内外分流), 重启 sing-box"""
     subs = load_subscriptions()
     if not subs:
         return jsonify({"error": "没有订阅, 请先添加"}), 400
     all_nodes = []
+    all_groups = []
     errors = []
     for s in subs:
         try:
             text = fetch_subscription(s["url"])
-            nodes = parse_subscription(text)
-            all_nodes.extend(nodes)
+            if yaml and ("proxies:" in text or "proxy-groups:" in text):
+                clash_full = parse_clash_yaml_full(text)
+                all_nodes.extend(clash_full["outbounds"])
+                # 只取第一个 Clash 订阅的代理组 (避免多订阅组冲突)
+                if not all_groups and clash_full.get("proxy_groups"):
+                    all_groups = clash_full["proxy_groups"]
+            else:
+                nodes = parse_subscription(text)
+                all_nodes.extend(nodes)
         except Exception as e:
             errors.append(f"{s['name']}: {e}")
     if not all_nodes:
         return jsonify({"error": "未解析到任何节点", "details": errors}), 400
-    # 合并进当前配置
-    config = load_config()
-    config = {k: v for k, v in config.items() if not k.startswith("_")}
-    config = merge_nodes_into_config(config, all_nodes)
+    # 构建: 防泄露DNS + 国内外分流 + 节点 + 代理组
+    cfg = get_panel_config()
+    clash_full = {"proxy_groups": all_groups} if all_groups else None
+    config = build_full_config_from_nodes(
+        all_nodes, cfg.get("gateway_mode", "tproxy"), clash_full
+    )
     # 校验
     tmp = CONFIG_FILE + ".tmp"
     with open(tmp, "w") as f:
@@ -1181,14 +1565,21 @@ def api_update_subs():
     return jsonify({
         "ok": True,
         "node_count": len(all_nodes),
+        "group_count": len(all_groups),
         "errors": errors,
-        "message": f"成功更新 {len(all_nodes)} 个节点, sing-box 已重启",
+        "message": f"成功更新 {len(all_nodes)} 个节点"
+                   + (f", {len(all_groups)} 个代理组" if all_groups else "")
+                   + ", sing-box 已重启",
     })
 
 
 @app.route("/api/convert", methods=["POST"])
 def api_convert():
-    """转换订阅链接 → sing-box JSON 配置 (下载)"""
+    """转换订阅链接 → sing-box JSON 配置 (预览)
+
+    自动检测格式: Clash YAML → 全量解析(含代理组) / V2Ray Base64 / sing-box JSON
+    自动注入: 防DNS泄露(fakeip) + 国内外分流(geosite/geoip)
+    """
     data = request.get_json()
     url = data.get("url", "").strip()
     template = data.get("template", "tproxy")
@@ -1196,23 +1587,32 @@ def api_convert():
         return jsonify({"error": "url required"}), 400
     try:
         text = fetch_subscription(url)
-        nodes = parse_subscription(text)
+        # 检测 Clash YAML → 全量解析 (含 proxy-groups)
+        clash_full = None
+        if yaml and ("proxies:" in text or "proxy-groups:" in text):
+            clash_full = parse_clash_yaml_full(text)
+            nodes = clash_full["outbounds"]
+        else:
+            nodes = parse_subscription(text)
         if not nodes:
             return jsonify({"error": "未能从订阅中解析到节点"}), 400
-        full_config = build_full_config_from_nodes(nodes, template)
-        return jsonify({
+        full_config = build_full_config_from_nodes(nodes, template, clash_full)
+        result = {
             "ok": True,
             "node_count": len(nodes),
             "nodes": [n["tag"] for n in nodes],
             "config": full_config,
-        })
+        }
+        if clash_full and clash_full.get("proxy_groups"):
+            result["proxy_groups"] = [g["tag"] for g in clash_full["proxy_groups"]]
+        return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/convert/download", methods=["POST"])
 def api_convert_download():
-    """转换并下载为 JSON 文件"""
+    """转换并下载为 JSON 文件 (含防DNS泄露 + 国内外分流)"""
     data = request.get_json()
     url = data.get("url", "").strip()
     template = data.get("template", "tproxy")
@@ -1220,8 +1620,15 @@ def api_convert_download():
         return jsonify({"error": "url required"}), 400
     try:
         text = fetch_subscription(url)
-        nodes = parse_subscription(text)
-        config = build_full_config_from_nodes(nodes, template)
+        clash_full = None
+        if yaml and ("proxies:" in text or "proxy-groups:" in text):
+            clash_full = parse_clash_yaml_full(text)
+            nodes = clash_full["outbounds"]
+        else:
+            nodes = parse_subscription(text)
+        if not nodes:
+            return jsonify({"error": "未能从订阅中解析到节点"}), 400
+        config = build_full_config_from_nodes(nodes, template, clash_full)
         content = json.dumps(config, indent=2, ensure_ascii=False)
         return Response(
             content,
@@ -1234,8 +1641,8 @@ def api_convert_download():
 
 @app.route("/api/convert/apply", methods=["POST"])
 def api_convert_apply():
-    """转换订阅并直接应用: 下载→解析→合并进模板→sing-box check 校验
-    →写入 config.json→重启 sing-box. 一键本地生效."""
+    """转换订阅并直接应用: 下载→解析→合并进模板(防DNS泄露+国内外分流)
+    →sing-box check 校验→写入 config.json→重启 sing-box. 一键本地生效."""
     data = request.get_json() or {}
     url = data.get("url", "").strip()
     template = data.get("template", "tproxy")
@@ -1245,15 +1652,21 @@ def api_convert_apply():
         text = fetch_subscription(url)
     except Exception as e:
         return jsonify({"error": f"订阅获取失败: {e}"}), 500
-    nodes = parse_subscription(text)
+    # 检测 Clash YAML → 全量解析 (含 proxy-groups)
+    clash_full = None
+    if yaml and ("proxies:" in text or "proxy-groups:" in text):
+        clash_full = parse_clash_yaml_full(text)
+        nodes = clash_full["outbounds"]
+    else:
+        nodes = parse_subscription(text)
     if not nodes:
         return jsonify({"error": "未能从订阅中解析到节点"}), 400
     # 备份当前配置
     if os.path.exists(CONFIG_FILE):
         shutil.copy2(CONFIG_FILE, CONFIG_FILE + ".bak")
-    # 构建完整配置 (模板 + 节点)
+    # 构建完整配置 (模板 + 防泄露DNS + 国内外分流 + 节点)
     try:
-        config = build_full_config_from_nodes(nodes, template)
+        config = build_full_config_from_nodes(nodes, template, clash_full)
     except Exception as e:
         return jsonify({"error": f"配置构建失败: {e}"}), 500
     # sing-box check 校验
@@ -1272,7 +1685,7 @@ def api_convert_apply():
     # 重启 sing-box
     rc, out, err = run_cmd("rc-service sing-box restart")
     restart_ok = rc == 0
-    return jsonify({
+    result = {
         "ok": True,
         "node_count": len(nodes),
         "nodes": [n["tag"] for n in nodes],
@@ -1280,7 +1693,10 @@ def api_convert_apply():
         "restarted": restart_ok,
         "message": f"成功转换 {len(nodes)} 个节点并应用为 {template} 模板, "
                    + ("sing-box 已重启" if restart_ok else "配置已写入但重启失败, 请手动重启"),
-    })
+    }
+    if clash_full and clash_full.get("proxy_groups"):
+        result["proxy_groups"] = [g["tag"] for g in clash_full["proxy_groups"]]
+    return jsonify(result)
 
 
 @app.route("/api/core/version")
@@ -1356,6 +1772,10 @@ def api_apply_template():
     config = load_config()
     existing_nodes = [o for o in config.get("outbounds", [])
                       if o.get("type") not in ("direct", "block", "dns", "selector", "urltest")]
+    # 注入防DNS泄露 + 国内外分流
+    proxy_domains = extract_proxy_domains(existing_nodes) if existing_nodes else None
+    tmpl["dns"] = build_anti_leak_dns(proxy_domains)
+    tmpl["route"] = build_geo_route_config()
     if existing_nodes:
         merge_nodes_into_config(tmpl, existing_nodes)
     # 校验
@@ -1368,7 +1788,7 @@ def api_apply_template():
         return jsonify({"error": f"模板校验失败: {msg}"}), 400
     os.replace(tmp, CONFIG_FILE)
     run_cmd("rc-service sing-box restart")
-    return jsonify({"ok": True, "message": f"已应用模板 {template}"})
+    return jsonify({"ok": True, "message": f"已应用模板 {template} (含防DNS泄露+国内外分流)"})
 
 
 @app.route("/api/logs")
@@ -1736,7 +2156,7 @@ label { font-size: 12px; color: var(--text-dim); display: block; margin-bottom: 
   <div id="tab-convert" class="tab hidden">
     <div class="card">
       <h2>订阅转换 (→ sing-box JSON)</h2>
-      <p style="color:var(--text-dim);font-size:12px;margin-bottom:12px">支持: Clash YAML (ss/vmess/vless/trojan/hysteria2/tuic/wireguard/socks5) / V2Ray Base64 (ss/vmess/vless/trojan/hy2/tuic) / sing-box JSON</p>
+      <p style="color:var(--text-dim);font-size:12px;margin-bottom:12px">支持: Clash YAML (ss/vmess/vless/trojan/hysteria2/tuic/wireguard/socks5) / V2Ray Base64 / sing-box JSON<br>✅ 自动注入: 防DNS泄露(fakeip+分流DNS) + 国内外分流(geosite/geoip) + Clash代理组转换</p>
       <div class="row">
         <div style="flex:3"><label>订阅地址</label><input id="conv-url" placeholder="https://..."></div>
         <div><label>模板</label><select id="conv-tpl"></select></div>

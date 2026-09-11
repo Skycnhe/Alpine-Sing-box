@@ -1,6 +1,6 @@
 {
   "_comment": "sing-box tproxy 透明网关模板 - 旁路由模式 (nftables redirect) [sing-box 1.12+ 新格式]",
-  "_usage": "配合 nftables 规则使用。已迁移至 sing-box 1.12+ 新 DNS/路由格式。",
+  "_usage": "配合 nftables 规则使用。含防DNS泄露(fakeip) + 国内外分流(geosite/geoip)。转换订阅时自动注入增强规则。",
   "log": {
     "disabled": false,
     "level": "info",
@@ -11,37 +11,53 @@
     "servers": [
       {
         "type": "https",
-        "tag": "remote-dns",
+        "tag": "proxy-dns",
         "server": "1.1.1.1",
         "detour": "select"
       },
       {
-        "type": "https",
-        "tag": "local-dns",
+        "type": "udp",
+        "tag": "direct-dns",
         "server": "223.5.5.5",
         "detour": "direct"
       },
       {
-        "type": "udp",
-        "tag": "fallback-dns",
-        "server": "8.8.8.8",
-        "detour": "select"
+        "type": "fakeip",
+        "tag": "fakeip-dns",
+        "inet4_range": "198.18.0.0/15"
       }
     ],
     "rules": [
       {
-        "rule_set": "geosite-cn",
-        "action": "route",
-        "server": "local-dns"
+        "rule_set": "geosite-category-ads-all",
+        "rcode": "REFUSED"
       },
       {
-        "rule_set": "geosite-category-ads-all",
-        "rcode": "SUCCESS"
+        "clash_mode": "direct",
+        "action": "route",
+        "server": "direct-dns"
+      },
+      {
+        "clash_mode": "global",
+        "action": "route",
+        "server": "proxy-dns"
+      },
+      {
+        "rule_set": "geosite-cn",
+        "action": "route",
+        "server": "direct-dns"
+      },
+      {
+        "query_type": ["A", "AAAA"],
+        "action": "route",
+        "server": "fakeip-dns"
       }
     ],
-    "final": "remote-dns",
+    "final": "proxy-dns",
     "strategy": "ipv4_only",
-    "reverse_mapping": true
+    "reverse_mapping": true,
+    "disable_cache": false,
+    "disable_expire": false
   },
   "inbounds": [
     {
@@ -104,10 +120,18 @@
         "outbound": "select"
       },
       {
-        "rule_set": [
-          "geosite-category-ads-all"
-        ],
+        "rule_set": "geosite-category-ads-all",
         "action": "reject"
+      },
+      {
+        "rule_set": [
+          "geosite-google",
+          "geosite-telegram",
+          "geosite-youtube",
+          "geosite-netflix",
+          "geosite-github"
+        ],
+        "outbound": "select"
       },
       {
         "rule_set": [
@@ -144,17 +168,45 @@
         "download_detour": "select"
       },
       {
-        "tag": "geosite-geolocation-!cn",
+        "tag": "geosite-google",
         "type": "remote",
         "format": "binary",
-        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-geolocation-!cn.srs",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-google.srs",
+        "download_detour": "select"
+      },
+      {
+        "tag": "geosite-telegram",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-telegram.srs",
+        "download_detour": "select"
+      },
+      {
+        "tag": "geosite-youtube",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-youtube.srs",
+        "download_detour": "select"
+      },
+      {
+        "tag": "geosite-netflix",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-netflix.srs",
+        "download_detour": "select"
+      },
+      {
+        "tag": "geosite-github",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-github.srs",
         "download_detour": "select"
       }
     ],
     "auto_detect_interface": true,
     "final": "select",
     "default_domain_resolver": {
-      "server": "local-dns"
+      "server": "direct-dns"
     }
   },
   "experimental": {
