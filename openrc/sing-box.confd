@@ -1,0 +1,13 @@
+# /etc/conf.d/sing-box — sing-box 核心服务配置
+#
+# sing-box 配置文件路径
+singbox_config="/etc/sing-box/config.json"
+
+# sing-box 二进制路径
+singbox_binary="/usr/local/bin/sing-box"
+
+# 运行用户 (透明代理需要 root)
+singbox_user="root"
+
+# 日志目录
+singbox_log_dir="/var/log/sing-box"

@@ -1,0 +1,40 @@
+#!/sbin/openrc-run
+#
+# /etc/init.d/singbox-panel — OpenRC service for the sing-box management panel
+# Config: /etc/conf.d/singbox-panel
+#
+
+description="sing-box gateway management panel"
+
+: ${panel_app:="/opt/singbox-gateway/panel/app.py"}
+: ${panel_host:="0.0.0.0"}
+: ${panel_port:="9999"}
+: ${panel_user:="root"}
+: ${panel_venv:="/opt/singbox-gateway/panel/venv"}
+
+command="${panel_venv}/bin/python"
+command_args="${panel_app} --host ${panel_host} --port ${panel_port}"
+command_user="${panel_user}"
+pidfile="/run/singbox-panel.pid"
+command_background="yes"
+output_log="/var/log/sing-box/panel-stdout.log"
+error_log="/var/log/sing-box/panel-stderr.log"
+
+depend() {
+    need net
+    after sing-box
+}
+
+start_pre() {
+    checkpath --directory --owner root:root --mode 0755 /var/log/sing-box
+
+    if [ ! -f "${panel_app}" ]; then
+        eerror "panel app not found at ${panel_app}"
+        return 1
+    fi
+
+    if [ ! -x "${panel_venv}/bin/python" ]; then
+        eerror "panel venv not found at ${panel_venv}, run deploy script first"
+        return 1
+    fi
+}

@@ -1,0 +1,84 @@
+#!/usr/sbin/nft -f
+#
+# sing-box tproxy 透明网关 nftables 规则
+#
+# 使用前将 LAN_SUBNET 替换为你的内网网段 (如 192.168.1.0/24)
+# 将 TPROXY_PORT 替换为 sing-box tproxy 监听端口 (如 7893)
+# 将 LAN_GATEWAY 替换为旁路由自身 IP (如 192.168.1.6) — 仅本机出站链需要
+#
+# 作用:
+#   1. 将局域网设备经旁路由的 TCP/UDP 流量重定向到 sing-box tproxy 端口
+#   2. 保留直连地址段 (内网/保留地址) 不走代理
+#   3. 本机出站流量打 fwmark 并经路由表 100 转入本地 tproxy
+
+flush ruleset
+
+# ========== 定义常量 ==========
+define LAN_SUBNET    = 192.168.1.0/24
+define TPROXY_PORT  = 7893
+define LAN_GATEWAY   = 192.168.1.6
+
+# 保留地址段 — 这些不走代理
+define RESERVED_IP = {
+    0.0.0.0/8,
+    10.0.0.0/8,
+    100.64.0.0/10,
+    127.0.0.0/8,
+    169.254.0.0/16,
+    172.16.0.0/12,
+    192.0.0.0/24,
+    192.168.0.0/16,
+    224.0.0.0/4,
+    240.0.0.0/4,
+    255.255.255.255/32
+}
+
+# ========== mangle 表: 局域网流量 (PREROUTING) ==========
+table ip sing-box {
+    chain prerouting {
+        type filter hook prerouting priority mangle; policy accept;
+
+        # --- 保留地址直连 ---
+        ip daddr $RESERVED_IP return
+
+        # --- 局域网内网通信直连 (但 DNS 端口 53 仍走代理做透明 DNS) ---
+        ip daddr $LAN_SUBNET tcp dport != 53 return
+        ip daddr $LAN_SUBNET udp dport != 53 return
+
+        # --- sing-box 自身发出的流量不重入 (打 mark 后被 output 链处理) ---
+        meta mark 1 return
+
+        # --- 重定向到 tproxy ---
+        ip protocol tcp  tproxy to :$TPROXY_PORT meta mark set 1
+        ip protocol udp  tproxy to :$TPROXY_PORT meta mark set 1
+    }
+
+    # ========== mangle 表: 本机出站流量 (OUTPUT) ==========
+    chain output {
+        type route hook output priority mangle; policy accept;
+
+        # --- 保留地址直连 ---
+        ip daddr $RESERVED_IP return
+
+        # --- 局域网内网通信直连 (DNS 除外) ---
+        ip daddr $LAN_SUBNET tcp dport != 53 return
+        ip daddr $LAN_SUBNET udp dport != 53 return
+
+        # --- sing-box 自身流量 (已打 mark) 不再处理 ---
+        meta mark 1 return
+
+        # --- 本机出站流量打 fwmark, 配合 ip rule 走 table 100 ---
+        ip protocol tcp meta mark set 1
+        ip protocol udp meta mark set 1
+    }
+
+    # ========== nat 表: MASQUERADE ==========
+    # 对经 tun/tproxy 接口出去的流量做 SNAT, 让回包能路由回来
+    chain postrouting {
+        type nat hook postrouting priority 100; policy accept;
+
+        # oifname "tun0" ip saddr $LAN_SUBNET masquerade
+        # 如使用 tproxy 模式 (无 tun 接口), 对代理后的流量做 masquerade:
+        ip saddr $LAN_SUBNET masquerade
+    }
+}

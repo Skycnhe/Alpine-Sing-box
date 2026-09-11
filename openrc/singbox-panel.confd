@@ -1,0 +1,13 @@
+# /etc/conf.d/singbox-panel — 管理面板服务配置
+#
+# 面板监听地址
+panel_host="0.0.0.0"
+
+# 面板监听端口
+panel_port="9999"
+
+# 运行用户
+panel_user="root"
+
+# venv 路径
+panel_venv="/opt/singbox-gateway/panel/venv"

@@ -1,0 +1,59 @@
+#!/sbin/openrc-run
+#
+# /etc/init.d/sing-box — OpenRC service for sing-box on Alpine Linux
+# Config: /etc/conf.d/sing-box
+#
+
+description="sing-box universal proxy platform"
+
+# ===== 可在 /etc/conf.d/sing-box 覆盖的变量 =====
+: ${singbox_config:="/etc/sing-box/config.json"}
+: ${singbox_binary:="/usr/local/bin/sing-box"}
+: ${singbox_user:="root"}
+: ${singbox_log_dir:="/var/log/sing-box"}
+
+command="${singbox_binary}"
+command_args="run -c ${singbox_config}"
+command_user="${singbox_user}"
+pidfile="/run/sing-box.pid"
+command_background="yes"
+output_log="${singbox_log_dir}/sing-box-stdout.log"
+error_log="${singbox_log_dir}/sing-box-stderr.log"
+
+depend() {
+    need net
+    after firewall
+    before networking
+}
+
+start_pre() {
+    # 确保日志目录存在
+    checkpath --directory --owner root:root --mode 0755 "${singbox_log_dir}" /etc/sing-box
+
+    # 检查二进制
+    if [ ! -x "${singbox_binary}" ]; then
+        eerror "sing-box binary not found at ${singbox_binary}"
+        return 1
+    fi
+
+    # 检查配置文件
+    if [ ! -f "${singbox_config}" ]; then
+        eerror "config file not found at ${singbox_config}"
+        return 1
+    fi
+
+    # 校验配置语法 (不阻止启动, 仅警告)
+    ebegin "Checking sing-box config"
+    "${singbox_binary}" check -c "${singbox_config}" 2>/dev/null
+    if [ $? -ne 0 ]; then
+        ewarn "sing-box config check failed, starting anyway..."
+    fi
+    eend 0
+}
+
+reload() {
+    ebegin "Reloading sing-box config"
+    "${singbox_binary}" format -c "${singbox_config}" -w 2>/dev/null
+    start-stop-daemon --signal HUP --pidfile "${pidfile}"
+    eend $?
+}
