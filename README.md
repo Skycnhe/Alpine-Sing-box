@@ -25,8 +25,10 @@
 | **自动部署** | 一键安装 sing-box 核心 + Web 面板 + OpenRC 服务 + 所有依赖 |
 | **透明网关** | 支持 tproxy（nftables 重定向）和 tun（自动路由）两种模式 |
 | **Web 面板** | Flask 管理面板：状态/配置/订阅/转换/核心更新/网络/日志 |
+| **多仪表盘** | 内置 metacubexd / zashboard / yacd 等前端，在线安装/切换/删除/更新 |
 | **订阅管理** | 添加/删除/更新订阅，自动拉取节点并合并入 config.json |
-| **订阅转换** | 内置解析器，支持 V2Ray base64 / Clash YAML → sing-box JSON |
+| **订阅转换** | 全协议解析器，支持 Clash YAML / V2Ray base64 → sing-box JSON |
+| **转换并应用** | 一键将 Clash 订阅转为 config.json + sing-box check 校验 + 重启，直接本地生效 |
 | **核心更新** | 面板内一键检测+下载+安装最新 sing-box 核心 |
 | **模板系统** | 内置 3 套透明网关模板，面板内一键切换 |
 
@@ -221,22 +223,40 @@ http://<旁路由IP>:9090
 
 | 输入格式 | 支持的协议 |
 |----------|-----------|
+| **Clash YAML** | ss, vmess, vless, trojan, hysteria2, tuic, wireguard, socks5, http（全传输：ws/grpc/h2/http/httpupgrade/quic/xhttp；全 TLS：tls/reality-opts/client-fingerprint/alpn/skip-cert-verify） |
 | **V2Ray Base64** | `ss://` `vmess://` `vless://` `trojan://` `hysteria2://` `hy2://` `tuic://` |
-| **Clash YAML** | ss, vmess, vless, trojan, hysteria2, tuic |
 | **sing-box JSON** | 直接透传 outbounds |
 
 ### 使用方式
 
-**面板操作**: 「转换」页 → 输入订阅 URL → 选择模板 → 点击「转换」→ 可下载 JSON
+**转换预览**: 「转换」页 → 输入订阅 URL → 选择模板 → 点击「转换预览」→ 查看节点和生成的 JSON
+
+**转换并应用（一键本地生效）**: 点击「⚡ 转换并应用」→ 自动执行：下载订阅 → 解析 → 合并进模板 → `sing-box check` 校验 → 写入 `config.json` → 重启 sing-box。Clash 订阅直接变成本地可用的透明网关配置。
 
 **命令行**:
 ```bash
-# 转换为 sing-box JSON（默认 tproxy 模板）
+# 转换为 sing-box JSON（默认 tproxy 模板，预览输出）
 bash sing-box-gateway-deploy.sh --convert "https://example.com/sub"
 
 # 指定 tun 模板
 bash sing-box-gateway-deploy.sh --convert "https://example.com/sub" tun
+
+# 转换并直接应用（写入 config.json + 校验 + 重启）
+bash sing-box-gateway-deploy.sh --convert-apply "https://example.com/sub" tproxy
 ```
+
+### Clash 订阅完整支持矩阵
+
+| 协议 | TLS | 传输 | 特殊字段 |
+|------|-----|------|----------|
+| ss | — | tcp | cipher, password, plugin |
+| vmess | tls/reality | ws/grpc/h2/http/quic | alterId, cipher, client-fingerprint, ws-opts(headers, early-data) |
+| vless | tls/reality | ws/grpc/h2/xhttp | flow(xtls-rprx-vision), reality-opts(public-key, short-id) |
+| trojan | tls(默认) | ws/grpc/h2 | sni, skip-cert-verify |
+| hysteria2 | tls | quic | up/down, obfs(salamander)+password |
+| tuic | tls | quic | congestion-controller, udp-relay-mode, reduce-rtt |
+| wireguard | — | — | private-key, public-key, ip, mtu |
+| socks5/http | tls(可选) | tcp | username, password, udp |
 
 ### 订阅管理流程
 
@@ -252,11 +272,15 @@ bash sing-box-gateway-deploy.sh --convert "https://example.com/sub" tun
 
 | 命令 | 作用 |
 |------|------|
-| `bash deploy.sh` | 完整部署 |
+| `bash deploy.sh` | 交互式菜单（默认） |
+| `bash deploy.sh --install` | 完整部署（非交互） |
 | `bash deploy.sh --update-core` | 更新 sing-box 核心 |
-| `bash deploy.sh --update-panel` | 更新管理面板 |
+| `bash deploy.sh --update-panel` | 更新 Flask 管理面板 |
+| `bash deploy.sh --update-dashboard <name>` | 安装/更新仪表盘（metacubexd/zashboard/yacd） |
 | `bash deploy.sh --update-sub` | 拉取并合并所有订阅 |
-| `bash deploy.sh --convert <URL> [模板]` | 转换订阅为 sing-box JSON |
+| `bash deploy.sh --convert <URL> [模板]` | 转换订阅为 sing-box JSON（预览） |
+| `bash deploy.sh --convert-apply <URL> [模板]` | 转换并应用（写入 config.json + 重启） |
+| `bash deploy.sh --status` | 查看当前配置与状态 |
 | `bash deploy.sh --uninstall` | 交互式卸载 |
 | `bash deploy.sh --help` | 显示帮助 |
 
@@ -267,6 +291,33 @@ rc-service singbox-panel start|stop|restart|status
 rc-service nftables-sing-box start|stop
 rc-update add sing-box default       # 开机自启
 ```
+
+---
+
+## 多仪表盘管理
+
+面板内置 **Clash API 前端仪表盘**管理，可在线安装/切换/删除/更新多种主流面板，全部本地托管，无需外网访问即可使用。
+
+### 内置仪表盘
+
+| 仪表盘 | 来源仓库 | 说明 |
+|--------|---------|------|
+| **metacubexd** | MetaCubeX/metacubexd | 官方面板，功能最全（推荐） |
+| **zashboard** | Zephyruso/zashboard | 现代 UI，含中文字体 |
+| **zashboard-lite** | Zephyruso/zashboard | 精简版，不含字体，体积小 |
+| **yacd** | haishanh/yacd | 经典面板 |
+
+### 使用方式
+
+**Web 面板**: 进入「仪表盘」页 → 选择仪表盘 → 安装/切换为活动/删除 → 点「打开仪表盘」
+
+**命令行**:
+```bash
+bash sing-box-gateway-deploy.sh --update-dashboard metacubexd
+# 或交互菜单选 8) 面板管理
+```
+
+安装后访问 `http://<旁路由IP>:9999/ui/` 自动跳转到当前活动仪表盘。首次使用在仪表盘设置中填入后端地址 `http://<旁路由IP>:9090`（sing-box Clash API）即可连接节点、切换代理、查看连接。
 
 ---
 

@@ -6,17 +6,20 @@
 #    1. 自动安装所有依赖 (nftables / iproute2 / python3 / flask ...)
 #    2. 自动识别架构 (12+) + 按架构匹配下载 sing-box 核心
 #    3. 自动下载/更新管理面板 (优先 GitHub 仓库, 回退本地)
-#    4. 配置透明网关 (tproxy / tun 两种模式)
-#    5. 一键更新: 核心 / 面板 / 订阅 / 订阅转换
-#    6. OpenRC 服务管理 (sing-box + panel)
+#    4. 多仪表盘管理 (metacubexd / zashboard / yacd 本地托管)
+#    5. 配置透明网关 (tproxy / tun 两种模式)
+#    6. 一键更新: 核心 / 面板 / 订阅 / 订阅转换(含直接应用)
+#    7. OpenRC 服务管理 (sing-box + panel)
 #
 #  用法:
 #    bash sing-box-gateway-deploy.sh              # 交互式菜单 (默认)
 #    bash sing-box-gateway-deploy.sh --install    # 完整部署 (非交互)
 #    bash sing-box-gateway-deploy.sh --update-core     # 仅更新核心
 #    bash sing-box-gateway-deploy.sh --update-panel    # 仅更新面板
+#    bash sing-box-gateway-deploy.sh --update-dashboard <name>  # 安装/更新仪表盘
 #    bash sing-box-gateway-deploy.sh --update-sub      # 更新订阅
-#    bash sing-box-gateway-deploy.sh --convert <URL>  # 转换订阅
+#    bash sing-box-gateway-deploy.sh --convert <URL>  # 转换订阅(预览)
+#    bash sing-box-gateway-deploy.sh --convert-apply <URL>  # 转换并应用
 #    bash sing-box-gateway-deploy.sh --uninstall       # 卸载
 #
 #  作者: WorkBuddy | 适配 Alpine Linux 3.18+
@@ -531,6 +534,156 @@ do_update_panel() {
     info "${GREEN}面板更新完成${NC}"
 }
 
+# ==================== 仪表盘管理 (走面板 API) ====================
+# 仪表盘由 Flask 面板本地托管, 故管理操作调用面板 API
+# 可用仪表盘: metacubexd / zashboard / zashboard-lite / yacd
+DASHBOARD_NAMES="metacubexd zashboard zashboard-lite yacd"
+
+panel_api() {
+    local panel_port
+    panel_port="$(jq -r '.panel_port // 9999' "$PANEL_CONFIG" 2>/dev/null || echo 9999)"
+    curl -s "http://127.0.0.1:${panel_port}$1"
+}
+
+panel_api_post() {
+    local panel_port
+    panel_port="$(jq -r '.panel_port // 9999' "$PANEL_CONFIG" 2>/dev/null || echo 9999)"
+    curl -s -X POST "http://127.0.0.1:${panel_port}$1" \
+        -H 'Content-Type: application/json' -d "$2"
+}
+
+panel_api_delete() {
+    local panel_port
+    panel_port="$(jq -r '.panel_port // 9999' "$PANEL_CONFIG" 2>/dev/null || echo 9999)"
+    curl -s -X DELETE "http://127.0.0.1:${panel_port}$1"
+}
+
+# 检查面板是否运行
+check_panel_running() {
+    local panel_port
+    panel_port="$(jq -r '.panel_port // 9999' "$PANEL_CONFIG" 2>/dev/null || echo 9999)"
+    curl -s --max-time 3 "http://127.0.0.1:${panel_port}/api/status" >/dev/null 2>&1
+}
+
+# 列出仪表盘 (解析面板 API 返回, 显示表格)
+list_dashboards_sh() {
+    if ! check_panel_running; then
+        warn "面板未运行, 无法查询仪表盘, 请先启动面板"
+        return 1
+    fi
+    info "可用/已安装的仪表盘:"
+    echo ""
+    printf "  %-16s %-8s %-8s %s\n" "名称" "状态" "活动" "说明"
+    printf "  %-16s %-8s %-8s %s\n" "----" "----" "----" "----"
+    panel_api "/api/dashboards" | jq -r '.[] | "  \(.name)\t\(.installed|tostring)\t\(.active|tostring)\t\(.desc)"' 2>/dev/null | \
+    while IFS=$'\t' read -r name installed active desc; do
+        local st="未安装"; [ "$installed" = "true" ] && st="${GREEN}已安装${NC}"
+        local ac=""; [ "$active" = "true" ] && ac="${GREEN}★${NC}"
+        printf "  %-16s %-8s %-8s %s\n" "$name" "$st" "$ac" "$desc"
+    done
+    echo ""
+}
+
+# 安装仪表盘 (走面板 API)
+install_dashboard_sh() {
+    local name="$1"
+    if [ -z "$name" ]; then
+        error "未指定仪表盘名"
+        return 1
+    fi
+    if ! check_panel_running; then
+        error "面板未运行, 无法安装仪表盘; 请先执行完整安装或启动面板服务"
+        return 1
+    fi
+    info "安装仪表盘: $name (从 GitHub 下载, 可能需要 1-2 分钟)..."
+    local result
+    result="$(panel_api_post "/api/dashboards/install" "{\"name\":\"$name\"}")"
+    if echo "$result" | jq -e '.ok' >/dev/null 2>&1; then
+        info "${GREEN}$(echo "$result" | jq -r '.message')${NC}"
+    else
+        error "$(echo "$result" | jq -r '.error // "安装失败"')"
+    fi
+}
+
+# 切换活动仪表盘
+activate_dashboard_sh() {
+    local name="$1"
+    if ! check_panel_running; then
+        error "面板未运行"
+        return 1
+    fi
+    local result
+    result="$(panel_api_post "/api/dashboards/${name}/activate" '{}')"
+    if echo "$result" | jq -e '.ok' >/dev/null 2>&1; then
+        info "${GREEN}$(echo "$result" | jq -r '.message')${NC}"
+    else
+        error "$(echo "$result" | jq -r '.error')"
+    fi
+}
+
+# 删除仪表盘
+delete_dashboard_sh() {
+    local name="$1"
+    if ! check_panel_running; then
+        error "面板未运行"
+        return 1
+    fi
+    local result
+    result="$(panel_api_delete "/api/dashboards/${name}")"
+    if echo "$result" | jq -e '.ok' >/dev/null 2>&1; then
+        info "${GREEN}$(echo "$result" | jq -r '.message')${NC}"
+    else
+        error "$(echo "$result" | jq -r '.error')"
+    fi
+}
+
+# ---- 面板管理子菜单 ----
+menu_panel_manage() {
+    while true; do
+        echo -e "\n${CYAN}── 面板管理 ──${NC}"
+        echo "  Flask 管理面板 (端口 9999, 本工具):"
+        echo "    u) 更新 Flask 面板代码 (从 GitHub/本地)"
+        echo "  Clash API 仪表盘 (前端, 本地托管):"
+        echo "    1) 安装 metacubexd   (官方, 推荐)"
+        echo "    2) 安装 zashboard    (现代, 含字体)"
+        echo "    3) 安装 zashboard-lite (精简)"
+        echo "    4) 安装 yacd         (经典)"
+        echo "    l) 列出所有仪表盘状态"
+        echo "    s) 切换活动仪表盘"
+        echo "    d) 删除仪表盘"
+        echo "    o) 打开活动仪表盘 (浏览器)"
+        echo "    0) 返回主菜单"
+        read -r -p "选择 [0-4/u/l/s/d/o]: " c
+        case "$c" in
+            u|U) do_update_panel ;;
+            1) install_dashboard_sh metacubexd ;;
+            2) install_dashboard_sh zashboard ;;
+            3) install_dashboard_sh zashboard-lite ;;
+            4) install_dashboard_sh yacd ;;
+            l|L) list_dashboards_sh ;;
+            s|S)
+                list_dashboards_sh
+                read -r -p "切换到哪个仪表盘: " dn
+                activate_dashboard_sh "$dn"
+                ;;
+            d|D)
+                list_dashboards_sh
+                read -r -p "删除哪个仪表盘: " dn
+                read -r -p "确认删除 $dn? (y/N) " yn
+                [ "$yn" = "y" ] && delete_dashboard_sh "$dn"
+                ;;
+            o|O)
+                local ip_addr
+                ip_addr="$(ip -4 addr show scope global 2>/dev/null | grep inet | awk '{print $2}' | head -1 | cut -d/ -f1)"
+                info "在浏览器打开: http://${ip_addr:-<IP>}:9999/ui/"
+                ;;
+            0|'') return 0 ;;
+            *) warn "无效选项" ;;
+        esac
+        read -r -p "按回车继续..." _
+    done
+}
+
 # ==================== 更新订阅 ====================
 do_update_sub() {
     step "更新订阅"
@@ -575,6 +728,40 @@ do_convert() {
         echo "$result" | jq '.config'
     else
         error "转换失败:"
+        echo "$result" | jq .
+    fi
+}
+
+# ==================== 转换并应用 (直接落地 config.json + 重启) ====================
+do_convert_apply() {
+    local sub_url="${1:-}"
+    if [ -z "$sub_url" ]; then
+        echo "用法: $0 --convert-apply <订阅URL> [模板]"
+        echo "模板: tproxy (默认) | tun | mixed"
+        return 1
+    fi
+    local template="${2:-tproxy}"
+    step "转换订阅并应用"
+    info "订阅地址: $sub_url"
+    info "使用模板: $template"
+    local panel_port
+    panel_port="$(jq -r '.panel_port // 9999' "$PANEL_CONFIG" 2>/dev/null || echo 9999)"
+
+    info "调用转换并应用 API (下载→解析→合并→校验→写入 config.json→重启)..."
+    local result
+    result="$(curl -s -X POST "http://127.0.0.1:${panel_port}/api/convert/apply" \
+        -H 'Content-Type: application/json' \
+        -d "{\"url\": \"$sub_url\", \"template\": \"$template\"}")"
+
+    if echo "$result" | jq -e '.ok' >/dev/null 2>&1; then
+        local count
+        count="$(echo "$result" | jq -r '.node_count')"
+        info "${GREEN}成功转换 $count 个节点并应用为 ${template} 模板${NC}"
+        echo "$result" | jq -r '.nodes[]' 2>/dev/null | head -20
+        echo ""
+        echo "$result" | jq -r '.message'
+    else
+        error "转换并应用失败:"
         echo "$result" | jq .
     fi
 }
@@ -747,6 +934,42 @@ menu_service_control() {
     done
 }
 
+# ---- 转换订阅子菜单 ----
+menu_convert() {
+    while true; do
+        echo -e "\n${CYAN}── 订阅转换 (Clash/V2Ray → sing-box) ──${NC}"
+        echo "  1) 转换预览      (解析订阅, 显示节点和生成的 JSON)"
+        echo "  2) 转换并应用    (写入 config.json + sing-box check + 重启, 一键生效)"
+        echo "  3) 转换并下载    (输出 JSON 到文件)"
+        echo "  0) 返回主菜单"
+        read -r -p "选择 [0-3]: " c
+        case "$c" in
+            1|2|3)
+                read -r -p "订阅URL: " su
+                [ -z "$su" ] && { warn "URL 不能为空"; continue; }
+                read -r -p "模板(tproxy/tun/mixed) [tproxy]: " tp
+                tp="${tp:-tproxy}"
+                case "$c" in
+                    1) do_convert "$su" "$tp" ;;
+                    2) do_convert_apply "$su" "$tp" ;;
+                    3) local out="/tmp/sing-box-config-$$.json"
+                       do_convert "$su" "$tp" | tail -n +1 > "$out" 2>/dev/null
+                       # 上面 do_convert 有额外输出, 用 API 直接取
+                       local pp; pp="$(jq -r '.panel_port // 9999' "$PANEL_CONFIG" 2>/dev/null || echo 9999)"
+                       curl -s -X POST "http://127.0.0.1:${pp}/api/convert" \
+                           -H 'Content-Type: application/json' \
+                           -d "{\"url\": \"$su\", \"template\": \"$tp\"}" | jq '.config' > "$out" 2>/dev/null
+                       info "${GREEN}配置已保存到 ${out}${NC}"
+                       ;;
+                esac
+                ;;
+            0|'') return 0 ;;
+            *) warn "无效选项" ;;
+        esac
+        read -r -p "按回车继续..." _
+    done
+}
+
 # ---- 网关模式子菜单 ----
 menu_setup_gateway() {
     while true; do
@@ -864,26 +1087,28 @@ main_menu() {
         echo "  2)  仅安装/更新核心"
         echo "  3)  仅安装/更新面板"
         echo "  4)  更新所有订阅  (拉取+合并节点到 config.json)"
-        echo "  5)  转换订阅      (输入订阅URL, 输出 sing-box 配置)"
+        echo "  5)  转换订阅      (Clash/V2Ray → sing-box, 预览/下载/应用)"
         echo "  6)  服务管理      (启动/停止/重启 各服务)"
         echo "  7)  配置透明网关  (切换 tproxy/TUN/Mixed + nftables 规则)"
-        echo "  8)  查看配置信息"
-        echo "  9)  查看日志"
-        echo " 10)  卸载"
+        echo "  8)  面板管理      (Flask面板更新 + 仪表盘安装/切换/删除)"
+        echo "  9)  查看配置信息"
+        echo " 10)  查看日志"
+        echo " 11)  卸载"
         echo "  0)  退出"
         echo ""
-        read -r -p "请选择 [0-10]: " choice
+        read -r -p "请选择 [0-11]: " choice
         case "$choice" in
             1)  full_install ;;
             2)  do_update_core ;;
             3)  do_update_panel ;;
             4)  do_update_sub ;;
-            5)  read -r -p "订阅URL: " su; read -r -p "模板(tproxy/tun/mixed) [tproxy]: " tp; do_convert "$su" "${tp:-tproxy}" ;;
+            5)  menu_convert ;;
             6)  menu_service_control ;;
             7)  menu_setup_gateway ;;
-            8)  show_info ;;
-            9)  show_logs ;;
-            10) do_uninstall ;;
+            8)  menu_panel_manage ;;
+            9)  show_info ;;
+            10) show_logs ;;
+            11) do_uninstall ;;
             0|"") echo "再见"; exit 0 ;;
             *) warn "无效选项: $choice" ;;
         esac
@@ -899,8 +1124,10 @@ main() {
         --install|--full) full_install ;;
         --update-core)  do_update_core ;;
         --update-panel) do_update_panel ;;
+        --update-dashboard) install_dashboard_sh "${2:-}" ;;
         --update-sub)   do_update_sub ;;
         --convert)      do_convert "${2:-}" "${3:-tproxy}" ;;
+        --convert-apply) do_convert_apply "${2:-}" "${3:-tproxy}" ;;
         --status)       show_info ;;
         --uninstall)    do_uninstall ;;
         --help|-h)
@@ -913,16 +1140,18 @@ sing-box 旁路由网关部署脚本 (Alpine Linux)
   bash $0 --install             完整部署 (非交互, 核心+面板+服务+配置)
   bash $0 --update-core         仅更新 sing-box 核心
   bash $0 --update-panel       仅更新管理面板
+  bash $0 --update-dashboard <name>  安装/更新仪表盘 (metacubexd/zashboard/yacd)
   bash $0 --update-sub         更新所有订阅并合并节点
   bash $0 --convert <URL> [模板]  转换订阅为 sing-box JSON
+  bash $0 --convert-apply <URL> [模板]  转换订阅并直接写入 config.json + 重启
                                   模板: tproxy / tun / mixed
   bash $0 --status              查看当前配置与状态
   bash $0 --uninstall          卸载 (交互式确认)
   bash $0 --help               显示此帮助
 
 菜单功能 (交互模式):
-  1 完整安装  2 更新核心  3 更新面板  4 更新订阅  5 转换订阅
-  6 服务管理  7 配置网关  8 查看信息  9 查看日志  10 卸载
+  1 完整安装  2 更新核心  3 更新面板  4 更新订阅  5 转换订阅(预览/应用)
+  6 服务管理  7 配置网关  8 面板管理  9 查看信息  10 查看日志  11 卸载
 
 模板说明:
   config-tproxy.json  tproxy 透明网关 (需 nftables 规则, 推荐旁路由)

@@ -52,6 +52,7 @@ LOG_DIR = "/var/log/sing-box"
 LOG_FILE = os.path.join(LOG_DIR, "sing-box-stderr.log")
 PANEL_DIR = "/opt/singbox-gateway"
 PANEL_CONFIG = os.path.join(CONFIG_DIR, "panel.json")
+DASHBOARD_DIR = os.path.join(PANEL_DIR, "dashboards")
 CLASH_API = "http://127.0.0.1:9090"
 
 # ============================================================
@@ -181,6 +182,154 @@ def get_recent_logs(lines=50):
         log_file = LOG_FILE
     code, out, _ = run_cmd(f"tail -n {lines} '{log_file}'")
     return out if out else "日志为空"
+
+
+# ============================================================
+# 仪表盘 (Clash API 前端) 管理
+# ============================================================
+# 内置仪表盘注册表: name → (仓库, 资源名匹配, 描述)
+# 这些是预编译的静态前端, 下载解压后本地托管, 通过 :9999 访问
+DASHBOARD_REGISTRY = {
+    "metacubexd": {
+        "repo": "MetaCubeX/metacubexd",
+        "asset": "compressed-dist.tgz",
+        "desc": "MetaCubeX 官方面板 (功能最全, 推荐)",
+    },
+    "zashboard": {
+        "repo": "Zephyruso/zashboard",
+        "asset": "dist.zip",
+        "desc": "Zashboard 现代面板 (含中文字体)",
+    },
+    "zashboard-lite": {
+        "repo": "Zephyruso/zashboard",
+        "asset": "dist-no-fonts.zip",
+        "desc": "Zashboard 精简版 (不含字体, 体积小)",
+    },
+    "yacd": {
+        "repo": "haishanh/yacd",
+        "asset": "yacd.tar.xz",
+        "desc": "yacd 经典面板",
+    },
+}
+
+
+def get_active_dashboard():
+    cfg = get_panel_config()
+    name = cfg.get("active_dashboard", "")
+    if name and os.path.exists(os.path.join(DASHBOARD_DIR, name, "index.html")):
+        return name
+    # 自动检测已安装的第一个
+    if os.path.isdir(DASHBOARD_DIR):
+        for d in sorted(os.listdir(DASHBOARD_DIR)):
+            if os.path.exists(os.path.join(DASHBOARD_DIR, d, "index.html")):
+                return d
+    return ""
+
+
+def list_dashboards():
+    """返回所有仪表盘状态: 注册表中的 + 已安装但不在注册表的"""
+    installed = []
+    if os.path.isdir(DASHBOARD_DIR):
+        installed = [d for d in os.listdir(DASHBOARD_DIR)
+                     if os.path.exists(os.path.join(DASHBOARD_DIR, d, "index.html"))]
+    result = []
+    for name, info in DASHBOARD_REGISTRY.items():
+        result.append({
+            "name": name,
+            "repo": info["repo"],
+            "desc": info["desc"],
+            "installed": name in installed,
+            "in_registry": True,
+        })
+    # 已安装但不在注册表 (手动放入的)
+    for d in installed:
+        if d not in DASHBOARD_REGISTRY:
+            result.append({"name": d, "repo": "", "desc": "自定义仪表盘",
+                           "installed": True, "in_registry": False})
+    active = get_active_dashboard()
+    for r in result:
+        r["active"] = (r["name"] == active)
+    return result
+
+
+def install_dashboard(name):
+    """下载并安装仪表盘: 查 GitHub release → 匹配资源 → 解压 → 部署"""
+    info = DASHBOARD_REGISTRY.get(name)
+    if not info:
+        return False, f"未知的仪表盘: {name}"
+    repo = info["repo"]
+    asset_match = info["asset"]
+    # 查最新 release
+    try:
+        r = requests.get(
+            f"https://api.github.com/repos/{repo}/releases/latest",
+            timeout=15, headers={"User-Agent": "singbox-panel"},
+        )
+        if r.status_code != 200:
+            return False, f"GitHub API 错误: {r.status_code}"
+        release = r.json()
+    except Exception as e:
+        return False, f"获取 release 失败: {e}"
+    # 匹配资源 (精确名 → 后缀兜底)
+    asset_url = ""
+    fallback_url = ""
+    for a in release.get("assets", []):
+        aname = a.get("name", "")
+        if aname == asset_match:
+            asset_url = a["browser_download_url"]
+            break
+        if not fallback_url and any(aname.endswith(ext) for ext in
+                                    (".tgz", ".tar.gz", ".tar.xz", ".zip")):
+            fallback_url = a["browser_download_url"]
+    if not asset_url:
+        asset_url = fallback_url
+    if not asset_url:
+        return False, f"release 中未找到匹配资源 (期望 {asset_match})"
+    # 下载
+    tmp_archive = f"/tmp/dashboard-{name}.archive"
+    try:
+        rr = requests.get(asset_url, timeout=120,
+                         headers={"User-Agent": "singbox-panel"})
+        rr.raise_for_status()
+        with open(tmp_archive, "wb") as f:
+            f.write(rr.content)
+    except Exception as e:
+        return False, f"下载失败: {e}"
+    # 解压到临时目录
+    import tempfile, zipfile, tarfile
+    tmp_extract = tempfile.mkdtemp(prefix="dash-")
+    try:
+        if asset_url.endswith(".zip"):
+            with zipfile.ZipFile(tmp_archive) as zf:
+                zf.extractall(tmp_extract)
+        elif asset_url.endswith((".tar.xz",)):
+            with tarfile.open(tmp_archive, "r:xz") as tf:
+                tf.extractall(tmp_extract)
+        else:  # tgz / tar.gz
+            with tarfile.open(tmp_archive, "r:gz") as tf:
+                tf.extractall(tmp_extract)
+    except Exception as e:
+        shutil.rmtree(tmp_extract, ignore_errors=True)
+        os.unlink(tmp_archive)
+        return False, f"解压失败: {e}"
+    os.unlink(tmp_archive)
+    # 找到 index.html 所在目录作为仪表盘根
+    root = None
+    for dirpath, dirnames, filenames in os.walk(tmp_extract):
+        if "index.html" in filenames:
+            root = dirpath
+            break
+    if not root:
+        shutil.rmtree(tmp_extract, ignore_errors=True)
+        return False, "解压后未找到 index.html (可能资源结构不符)"
+    # 部署到 DASHBOARD_DIR/<name>/
+    target = os.path.join(DASHBOARD_DIR, name)
+    if os.path.exists(target):
+        shutil.rmtree(target)
+    os.makedirs(DASHBOARD_DIR, exist_ok=True)
+    shutil.move(root, target)
+    shutil.rmtree(tmp_extract, ignore_errors=True)
+    return True, f"仪表盘 {name} 安装成功 (版本 {release.get('tag_name','?')})"
 
 
 # ============================================================
@@ -522,80 +671,229 @@ def parse_tuic(uri):
         return None
 
 
+def _clash_build_tls(p):
+    """从 Clash proxy 字典构建 sing-box TLS 配置 (vmess/vless/trojan/hy2/tuic 通用)"""
+    tls = {}
+    ptype = p.get("type", "").lower()
+    # 是否启用 TLS
+    if p.get("tls") or p.get("reality-opts"):
+        tls["enabled"] = True
+    elif ptype == "trojan":
+        tls["enabled"] = True  # trojan 默认 TLS
+    if not tls.get("enabled"):
+        return {}
+    # SNI
+    sni = p.get("servername") or p.get("sni") or p.get("host") or p.get("server", "")
+    if sni:
+        tls["server_name"] = sni
+    if p.get("skip-cert-verify"):
+        tls["insecure"] = True
+    if p.get("disable-sni"):
+        tls["insecure"] = True
+    # ALPN
+    alpn = p.get("alpn")
+    if alpn:
+        tls["alpn"] = alpn if isinstance(alpn, list) else [alpn]
+    # uTLS 指纹
+    fp = p.get("client-fingerprint") or p.get("fingerprint")
+    if fp:
+        tls["utls"] = {"enabled": True, "fingerprint": fp}
+    # REALITY
+    reality = p.get("reality-opts") or {}
+    if reality and (reality.get("public-key") or reality.get("short-id")):
+        tls["reality"] = {"enabled": True}
+        if reality.get("public-key"):
+            tls["reality"]["public_key"] = reality["public-key"]
+        if reality.get("short-id"):
+            tls["reality"]["short_id"] = reality["short-id"]
+    return tls
+
+
+def _clash_build_transport(p):
+    """从 Clash proxy 字典构建 sing-box transport 配置"""
+    net = (p.get("network") or "tcp").lower()
+    if net == "tcp":
+        return {}
+    if net == "ws":
+        ws = p.get("ws-opts") or {}
+        t = {"type": "ws", "path": ws.get("path", "/")}
+        headers = ws.get("headers") or {}
+        if headers:
+            t["headers"] = {str(k): str(v) for k, v in headers.items()}
+        if ws.get("max-early-data") is not None:
+            t["max_early_data"] = ws["max-early-data"]
+        if ws.get("early-data-header-name"):
+            t["early_data_header_name"] = ws["early-data-header-name"]
+        return t
+    if net == "grpc":
+        grpc = p.get("grpc-opts") or {}
+        return {"type": "grpc", "service_name": grpc.get("grpc-service-name", "")}
+    if net == "h2":
+        h2 = p.get("h2-opts") or {}
+        t = {"type": "http", "path": h2.get("path", "/")}
+        host = h2.get("host")
+        if host:
+            t["host"] = host if isinstance(host, list) else [host]
+        return t
+    if net == "http":
+        ho = p.get("http-opts") or {}
+        path = ho.get("path")
+        if isinstance(path, list):
+            path = path[0] if path else "/"
+        t = {"type": "http", "path": path or "/"}
+        headers = ho.get("headers") or {}
+        if headers:
+            host = list(headers.keys())[0] if headers else ""
+            if host:
+                t["host"] = [host]
+        return t
+    if net == "httpupgrade":
+        ws = p.get("ws-opts") or p.get("httpupgrade-opts") or {}
+        return {"type": "httpupgrade", "path": ws.get("path", "/")}
+    if net == "quic":
+        return {"type": "quic"}
+    if net == "xhttp":
+        xo = p.get("xhttp-opts") or p.get("ws-opts") or {}
+        return {"type": "xhttp", "path": xo.get("path", "/")}
+    return {}
+
+
 def parse_clash_yaml(text):
-    """解析 Clash YAML 订阅 → sing-box outbounds 列表"""
+    """解析 Clash YAML 订阅 → sing-box outbounds 列表 (全协议全传输)
+
+    支持: ss / vmess / vless / trojan / hysteria2 / tuic / wireguard / socks5 / http
+    传输: tcp / ws / grpc / h2 / http / httpupgrade / quic / xhttp
+    TLS : tls / reality-opts / client-fingerprint / alpn / skip-cert-verify
+    """
     if not yaml:
         return []
     try:
         data = yaml.safe_load(text)
-        proxies = data.get("proxies", [])
-        outbounds = []
-        for p in proxies:
-            ptype = p.get("type", "").lower()
-            tag = p.get("name", p.get("server", "node"))
-            if ptype == "ss":
-                ob = {
-                    "tag": tag, "type": "shadowsocks",
-                    "server": p["server"], "server_port": int(p["port"]),
-                    "method": p["cipher"], "password": p["password"],
-                }
-            elif ptype == "vmess":
-                ob = {
-                    "tag": tag, "type": "vmess",
-                    "server": p["server"], "server_port": int(p["port"]),
-                    "uuid": p["uuid"], "security": p.get("cipher", "auto"),
-                    "alter_id": int(p.get("alterId", 0)),
-                }
-                if p.get("tls"):
-                    ob["tls"] = {"enabled": True, "server_name": p.get("servername", "")}
-                    if p.get("skip-cert-verify"):
-                        ob["tls"]["insecure"] = True
-                if p.get("network") == "ws":
-                    ob["transport"] = {"type": "ws", "path": p.get("ws-opts", {}).get("path", "/")}
-                    h = p.get("ws-opts", {}).get("headers", {}).get("Host", "")
-                    if h:
-                        ob["transport"]["headers"] = {"Host": h}
-            elif ptype == "vless":
-                ob = {
-                    "tag": tag, "type": "vless",
-                    "server": p["server"], "server_port": int(p["port"]),
-                    "uuid": p["uuid"],
-                }
-                if p.get("tls"):
-                    ob["tls"] = {"enabled": True, "server_name": p.get("servername", "")}
-                if p.get("flow"):
-                    ob["flow"] = p["flow"]
-                if p.get("network") == "ws":
-                    ob["transport"] = {"type": "ws", "path": p.get("ws-opts", {}).get("path", "/")}
-            elif ptype == "trojan":
-                ob = {
-                    "tag": tag, "type": "trojan",
-                    "server": p["server"], "server_port": int(p["port"]),
-                    "password": p["password"],
-                    "tls": {"enabled": True, "server_name": p.get("sni", p["server"])},
-                }
-                if p.get("skip-cert-verify"):
-                    ob["tls"]["insecure"] = True
-            elif ptype in ("hysteria2", "hy2"):
-                ob = {
-                    "tag": tag, "type": "hysteria2",
-                    "server": p["server"], "server_port": int(p["port"]),
-                    "password": p.get("password", ""),
-                    "tls": {"enabled": True, "server_name": p.get("sni", p["server"])},
-                }
-            elif ptype == "tuic":
-                ob = {
-                    "tag": tag, "type": "tuic",
-                    "server": p["server"], "server_port": int(p["port"]),
-                    "uuid": p["uuid"], "password": p.get("password", ""),
-                    "tls": {"enabled": True, "server_name": p.get("sni", p["server"])},
-                }
-            else:
-                continue
-            outbounds.append(ob)
-        return outbounds
     except Exception:
         return []
+    proxies = data.get("proxies") or []
+    outbounds = []
+    for p in proxies:
+        try:
+            ptype = (p.get("type") or "").lower()
+            tag = p.get("name") or p.get("server") or "node"
+            server = p.get("server", "")
+            port = int(p.get("port", 443))
+            ob = None
+            if ptype == "ss":
+                ob = {"tag": tag, "type": "shadowsocks", "server": server,
+                      "server_port": port, "method": p.get("cipher", ""),
+                      "password": p.get("password", "")}
+                plugin = p.get("plugin")
+                if plugin:
+                    ob["plugin"] = plugin
+                    popts = p.get("plugin-opts") or {}
+                    if popts:
+                        ob["plugin_opts"] = popts
+            elif ptype == "vmess":
+                ob = {"tag": tag, "type": "vmess", "server": server,
+                      "server_port": port, "uuid": p.get("uuid", ""),
+                      "security": p.get("cipher", "auto"),
+                      "alter_id": int(p.get("alterId", 0))}
+                if p.get("global-padding"):
+                    ob["global_padding"] = True
+                if p.get("authenticated-length"):
+                    ob["authenticated_length"] = True
+                pe = p.get("packet-encoding")
+                if pe == "xudp":
+                    ob["packet_encoding"] = "xudp"
+                elif pe == "packetaddr":
+                    ob["packet_encoding"] = "packetaddr"
+            elif ptype == "vless":
+                ob = {"tag": tag, "type": "vless", "server": server,
+                      "server_port": port, "uuid": p.get("uuid", "")}
+                if p.get("flow"):
+                    ob["flow"] = p["flow"]
+                pe = p.get("packet-encoding")
+                if pe == "xudp":
+                    ob["packet_encoding"] = "xudp"
+                elif pe == "packetaddr":
+                    ob["packet_encoding"] = "packetaddr"
+            elif ptype == "trojan":
+                ob = {"tag": tag, "type": "trojan", "server": server,
+                      "server_port": port, "password": p.get("password", "")}
+            elif ptype in ("hysteria2", "hy2"):
+                ob = {"tag": tag, "type": "hysteria2", "server": server,
+                      "server_port": port, "password": p.get("password", "")}
+                up = p.get("up")
+                down = p.get("down")
+                if up:
+                    ob["up_mbps"] = _parse_bw(up)
+                if down:
+                    ob["down_mbps"] = _parse_bw(down)
+                if p.get("obfs"):
+                    ob["obfs"] = {"type": p["obfs"]}
+                    if p.get("obfs-password"):
+                        ob["obfs"]["password"] = p["obfs-password"]
+            elif ptype == "tuic":
+                ob = {"tag": tag, "type": "tuic", "server": server,
+                      "server_port": port, "uuid": p.get("uuid", ""),
+                      "password": p.get("password", "")}
+                ob["congestion_control"] = p.get("congestion-controller", "bbr")
+                ob["udp_relay_mode"] = p.get("udp-relay-mode", "native")
+                if p.get("reduce-rtt"):
+                    ob["reduce_rtt"] = True
+            elif ptype == "wireguard":
+                ob = {"tag": tag, "type": "wireguard", "server": server,
+                      "server_port": port}
+                priv = p.get("private-key") or p.get("privateKey", "")
+                ob["private_key"] = priv
+                pub = p.get("public-key") or p.get("publicKey")
+                if pub:
+                    ob["peer_public_key"] = pub
+                if p.get("ip"):
+                    ob["local_addresses"] = [p["ip"]] if isinstance(p["ip"], str) else p["ip"]
+                if p.get("mtu"):
+                    ob["mtu"] = int(p["mtu"])
+                continue  # wireguard 的 tls/transport 不适用, 直接跳过
+            elif ptype in ("socks5", "socks"):
+                ob = {"tag": tag, "type": "socks", "server": server,
+                      "server_port": port}
+                if p.get("username"):
+                    ob["username"] = p["username"]
+                if p.get("password"):
+                    ob["password"] = p["password"]
+                if p.get("udp") is not None:
+                    ob["udp"] = p["udp"]
+                outbounds.append(ob)
+                continue
+            elif ptype == "http":
+                ob = {"tag": tag, "type": "http", "server": server,
+                      "server_port": port}
+                if p.get("username"):
+                    ob["username"] = p["username"]
+                if p.get("password"):
+                    ob["password"] = p["password"]
+                if p.get("tls"):
+                    ob["tls"] = {"enabled": True}
+                outbounds.append(ob)
+                continue
+            else:
+                continue
+            # 通用 TLS + transport (除 wireguard/socks/http)
+            tls = _clash_build_tls(p)
+            if tls:
+                ob["tls"] = tls
+            transport = _clash_build_transport(p)
+            if transport:
+                ob["transport"] = transport
+            outbounds.append(ob)
+        except Exception:
+            continue
+    return outbounds
+
+
+def _parse_bw(val):
+    """解析带宽值 (Clash: '30 Mbps' / 数字) → Mbps 整数"""
+    if isinstance(val, (int, float)):
+        return int(val)
+    m = re.search(r'(\d+)', str(val))
+    return int(m.group(1)) if m else 0
 
 
 def parse_subscription(text):
@@ -934,6 +1232,57 @@ def api_convert_download():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/convert/apply", methods=["POST"])
+def api_convert_apply():
+    """转换订阅并直接应用: 下载→解析→合并进模板→sing-box check 校验
+    →写入 config.json→重启 sing-box. 一键本地生效."""
+    data = request.get_json() or {}
+    url = data.get("url", "").strip()
+    template = data.get("template", "tproxy")
+    if not url:
+        return jsonify({"error": "url required"}), 400
+    try:
+        text = fetch_subscription(url)
+    except Exception as e:
+        return jsonify({"error": f"订阅获取失败: {e}"}), 500
+    nodes = parse_subscription(text)
+    if not nodes:
+        return jsonify({"error": "未能从订阅中解析到节点"}), 400
+    # 备份当前配置
+    if os.path.exists(CONFIG_FILE):
+        shutil.copy2(CONFIG_FILE, CONFIG_FILE + ".bak")
+    # 构建完整配置 (模板 + 节点)
+    try:
+        config = build_full_config_from_nodes(nodes, template)
+    except Exception as e:
+        return jsonify({"error": f"配置构建失败: {e}"}), 500
+    # sing-box check 校验
+    tmp = CONFIG_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+    ok, msg = validate_config(tmp)
+    if not ok:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return jsonify({"error": f"配置校验失败: {msg}", "node_count": len(nodes)}), 500
+    # 写入 config.json
+    os.replace(tmp, CONFIG_FILE)
+    # 重启 sing-box
+    rc, out, err = run_cmd("rc-service sing-box restart")
+    restart_ok = rc == 0
+    return jsonify({
+        "ok": True,
+        "node_count": len(nodes),
+        "nodes": [n["tag"] for n in nodes],
+        "template": template,
+        "restarted": restart_ok,
+        "message": f"成功转换 {len(nodes)} 个节点并应用为 {template} 模板, "
+                   + ("sing-box 已重启" if restart_ok else "配置已写入但重启失败, 请手动重启"),
+    })
+
+
 @app.route("/api/core/version")
 def api_core_version():
     return jsonify({"installed": get_singbox_version(), "latest": get_latest_version()})
@@ -1142,6 +1491,113 @@ def api_tproxy_clear():
 
 
 # ============================================================
+# 仪表盘 (Clash API 前端) 路由
+# ============================================================
+
+@app.route("/api/dashboards")
+def api_dashboards():
+    """列出所有可用/已安装的仪表盘"""
+    return jsonify(list_dashboards())
+
+
+@app.route("/api/dashboards/install", methods=["POST"])
+def api_dashboard_install():
+    """从 GitHub 下载并安装仪表盘"""
+    data = request.get_json() or {}
+    name = data.get("name", "").strip()
+    if not name:
+        return jsonify({"error": "name required"}), 400
+    ok, msg = install_dashboard(name)
+    if not ok:
+        return jsonify({"error": msg}), 500
+    # 安装后自动设为活动仪表盘 (如果是第一个)
+    if not get_active_dashboard():
+        cfg = get_panel_config()
+        cfg["active_dashboard"] = name
+        save_panel_config(cfg)
+    return jsonify({"ok": True, "message": msg, "dashboards": list_dashboards()})
+
+
+@app.route("/api/dashboards/active")
+def api_dashboard_active():
+    return jsonify({"active": get_active_dashboard()})
+
+
+@app.route("/api/dashboards/<name>/activate", methods=["POST"])
+def api_dashboard_activate(name):
+    name = name.strip()
+    if not os.path.exists(os.path.join(DASHBOARD_DIR, name, "index.html")):
+        return jsonify({"error": f"仪表盘 {name} 未安装"}), 400
+    cfg = get_panel_config()
+    cfg["active_dashboard"] = name
+    save_panel_config(cfg)
+    return jsonify({"ok": True, "message": f"已切换到 {name}",
+                    "url": f"/dashboard/{name}/"})
+
+
+@app.route("/api/dashboards/<name>", methods=["DELETE"])
+def api_dashboard_delete(name):
+    target = os.path.join(DASHBOARD_DIR, name.strip())
+    if not os.path.isdir(target):
+        return jsonify({"error": "仪表盘不存在"}), 404
+    shutil.rmtree(target, ignore_errors=True)
+    cfg = get_panel_config()
+    if cfg.get("active_dashboard") == name:
+        cfg["active_dashboard"] = ""
+        save_panel_config(cfg)
+    return jsonify({"ok": True, "message": f"已删除 {name}",
+                    "dashboards": list_dashboards()})
+
+
+@app.route("/ui/")
+@app.route("/ui")
+def ui_redirect():
+    """根 /ui/ 跳转到当前活动仪表盘"""
+    active = get_active_dashboard()
+    if active:
+        return Response(f'<meta http-equiv="refresh" content="0;url=/dashboard/{active}/">',
+                        mimetype="text/html")
+    return Response("<h3>暂无已安装的仪表盘</h3><p>请先在「面板管理」页安装一个仪表盘。</p>",
+                    mimetype="text/html")
+
+
+@app.route("/dashboard/<name>/")
+@app.route("/dashboard/<name>/<path:p>")
+def serve_dashboard(name, p="index.html"):
+    """静态托管仪表盘文件 (防目录穿越)"""
+    name = name.strip()
+    base = os.path.realpath(os.path.join(DASHBOARD_DIR, name))
+    target = os.path.realpath(os.path.join(base, p))
+    # 防穿越: target 必须在 base 之内
+    if not target.startswith(base + os.sep) and target != base:
+        return Response("Forbidden", status=403)
+    if not os.path.isfile(target):
+        # SPA 兜底: 不存在的路径回退 index.html
+        target = os.path.join(base, "index.html")
+        if not os.path.isfile(target):
+            return Response("仪表盘未安装, 请先安装", status=404)
+    # index.html 注入 Clash API 提示 (仅首页)
+    if p == "index.html":
+        try:
+            with open(target, "r", encoding="utf-8") as f:
+                content = f.read()
+            # 注入一段提示脚本: 若未配置后端, 提示连接 :9090
+            inject = (
+                "<script>window.__SINGBOX_PANEL=1;"
+                "window.__CLASH_API_HINT=' Clash API 运行在 :9090, 首次使用请在仪表盘设置中填入后端地址';"
+                "</script>"
+            )
+            if "</head>" in content:
+                content = content.replace("</head>", inject + "</head>", 1)
+            return Response(content, mimetype="text/html")
+        except Exception:
+            pass
+    import mimetypes
+    mime, _ = mimetypes.guess_type(target)
+    return Response(open(target, "rb").read(), mimetype=mime or "application/octet-stream")
+
+
+# ============================================================
 # Dashboard HTML
 # ============================================================
 
@@ -1210,6 +1666,7 @@ label { font-size: 12px; color: var(--text-dim); display: block; margin-bottom: 
       <button onclick="showTab('subs')">订阅</button>
       <button onclick="showTab('convert')">转换</button>
       <button onclick="showTab('update')">更新</button>
+      <button onclick="showTab('dashboard-mgr')">仪表盘</button>
       <button onclick="showTab('network')">网络</button>
       <button onclick="showTab('logs')">日志</button>
     </nav>
@@ -1279,14 +1736,15 @@ label { font-size: 12px; color: var(--text-dim); display: block; margin-bottom: 
   <div id="tab-convert" class="tab hidden">
     <div class="card">
       <h2>订阅转换 (→ sing-box JSON)</h2>
-      <p style="color:var(--text-dim);font-size:12px;margin-bottom:12px">支持: V2Ray Base64 (ss/vmess/vless/trojan/hysteria2/tuic) / Clash YAML / sing-box JSON</p>
+      <p style="color:var(--text-dim);font-size:12px;margin-bottom:12px">支持: Clash YAML (ss/vmess/vless/trojan/hysteria2/tuic/wireguard/socks5) / V2Ray Base64 (ss/vmess/vless/trojan/hy2/tuic) / sing-box JSON</p>
       <div class="row">
         <div style="flex:3"><label>订阅地址</label><input id="conv-url" placeholder="https://..."></div>
         <div><label>模板</label><select id="conv-tpl"></select></div>
       </div>
       <div class="actions">
-        <button class="btn primary" onclick="convertSub()">转换</button>
-        <button class="btn green" onclick="convertDownload()">下载 JSON</button>
+        <button class="btn primary" onclick="convertSub()">转换预览</button>
+        <button class="btn green" onclick="convertApply()">⚡ 转换并应用 (写入 config.json + 重启)</button>
+        <button class="btn" onclick="convertDownload()">下载 JSON</button>
       </div>
     </div>
     <div class="card hidden" id="conv-result">
@@ -1310,6 +1768,20 @@ label { font-size: 12px; color: var(--text-dim); display: block; margin-bottom: 
       <h2>面板更新</h2>
       <p style="color:var(--text-dim);font-size:12px">面板代码位于 /opt/singbox-gateway/panel/，可通过重新运行部署脚本更新:</p>
       <pre style="background:var(--bg);padding:12px;border-radius:6px;font-size:11px;margin-top:8px">bash /opt/singbox-gateway/sing-box-gateway-deploy.sh --update-panel</pre>
+    </div>
+  </div>
+
+  <!-- 仪表盘 -->
+  <div id="tab-dashboard-mgr" class="tab hidden">
+    <div class="card">
+      <h2>Clash API 仪表盘 (前端)</h2>
+      <p style="color:var(--text-dim);font-size:12px;margin-bottom:12px">这些是 sing-box 内置 Clash API (:9090) 的 Web 前端, 本地托管, 无需外网。安装后在仪表盘设置中填入后端地址 <b>http://本机IP:9090</b> 即可连接。</p>
+      <div id="dash-list"></div>
+    </div>
+    <div class="card">
+      <h2>当前活动仪表盘</h2>
+      <div id="dash-active" style="font-size:14px;margin-bottom:12px"></div>
+      <a class="btn primary" id="dash-open" href="/ui/" target="_blank" style="text-decoration:none;display:inline-block">打开仪表盘 ↗</a>
     </div>
   </div>
 
@@ -1352,11 +1824,12 @@ function showTab(name) {
   document.querySelectorAll('.tab').forEach(t => t.classList.add('hidden'));
   document.getElementById('tab-' + name).classList.remove('hidden');
   document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
-  [...document.querySelectorAll('nav button')].find(b => b.textContent.includes({dashboard:'概览',config:'配置',subs:'订阅',convert:'转换',update:'更新',network:'网络',logs:'日志'}[name])).classList.add('active');
+  [...document.querySelectorAll('nav button')].find(b => b.textContent.includes({dashboard:'概览',config:'配置',subs:'订阅',convert:'转换',update:'更新','dashboard-mgr':'仪表盘',network:'网络',logs:'日志'}[name])).classList.add('active');
   if (name === 'dashboard') loadStatus();
   if (name === 'config') { loadConfig(); loadTemplates('tpl-select'); }
   if (name === 'convert') loadTemplates('conv-tpl');
   if (name === 'update') loadVersion();
+  if (name === 'dashboard-mgr') loadDashboards();
   if (name === 'network') loadNetStatus();
 }
 
@@ -1492,6 +1965,23 @@ function convertDownload() {
     .then(b => { const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = 'sing-box-config.json'; a.click(); });
 }
 
+async function convertApply() {
+  const url = document.getElementById('conv-url').value;
+  const tpl = document.getElementById('conv-tpl').value;
+  if (!url) { msg('请输入订阅地址', true); return; }
+  if (!confirm('将转换订阅并直接写入 config.json 然后 sing-box check 校验 + 重启, 确认?')) return;
+  msg('正在转换并应用...');
+  const r = await fetch('/api/convert/apply', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({url, template: tpl}) });
+  const d = await r.json();
+  if (d.ok) {
+    document.getElementById('conv-result').classList.remove('hidden');
+    document.getElementById('conv-info').innerHTML = `✅ 成功解析 <b>${d.node_count}</b> 个节点, 已应用 <b>${d.template}</b> 模板并重启`;
+    msg(d.message || '已应用', false);
+  } else {
+    msg(d.error || '应用失败', true);
+  }
+}
+
 async function loadVersion() {
   const r = await fetch('/api/core/version');
   const d = await r.json();
@@ -1544,6 +2034,53 @@ async function loadLogs(lines) {
   const r = await fetch('/api/logs?lines=' + lines);
   const d = await r.json();
   document.getElementById('log-box').textContent = d.logs;
+}
+
+async function loadDashboards() {
+  const r = await fetch('/api/dashboards');
+  const d = await r.json();
+  const list = document.getElementById('dash-list');
+  list.innerHTML = d.map(db => `
+    <div class="sub-item">
+      <div>
+        <div class="name">${db.name}${db.active?' <span class="badge green">活动中</span>':''}${db.installed?' <span class="badge green">已安装</span>':' <span class="badge red">未安装</span>'}</div>
+        <div class="url">${db.desc}${db.repo?' · '+db.repo:''}</div>
+      </div>
+      <div style="display:flex;gap:6px">
+        ${db.installed ? `
+          <button class="btn ${db.active?'':''}" ${db.active?'disabled':''} onclick="activateDash('${db.name}')">${db.active?'活动中':'切换为活动'}</button>
+          <a class="btn" href="/dashboard/${db.name}/" target="_blank" style="text-decoration:none;display:inline-block">打开</a>
+          <button class="btn danger" onclick="delDash('${db.name}')">删除</button>
+        ` : `
+          <button class="btn primary" onclick="installDash('${db.name}')">安装</button>
+        `}
+      </div>
+    </div>`).join('');
+  const active = d.find(x => x.active);
+  document.getElementById('dash-active').textContent = active ? `当前活动: ${active.name} (${active.desc})` : '未设置活动仪表盘';
+}
+
+async function installDash(name) {
+  msg('正在下载并安装 ' + name + ' ...');
+  const r = await fetch('/api/dashboards/install', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({name}) });
+  const d = await r.json();
+  msg(d.message || d.error, !d.ok);
+  loadDashboards();
+}
+
+async function activateDash(name) {
+  const r = await fetch('/api/dashboards/' + encodeURIComponent(name) + '/activate', { method: 'POST' });
+  const d = await r.json();
+  msg(d.message || d.error, !d.ok);
+  loadDashboards();
+}
+
+async function delDash(name) {
+  if (!confirm('确定删除仪表盘 ' + name + '?')) return;
+  const r = await fetch('/api/dashboards/' + encodeURIComponent(name), { method: 'DELETE' });
+  const d = await r.json();
+  msg(d.message || d.error, !d.ok);
+  loadDashboards();
 }
 
 loadStatus();
