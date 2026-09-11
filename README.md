@@ -2,8 +2,35 @@
 
 > 基于 sing-box 核心的 Alpine Linux 旁路由透明代理网关，自带 Web 管理面板、订阅解析/转换、一键更新。
 
+## 一键安装
+
+在 Alpine Linux 上执行以下命令，全自动完成下载 + 部署 + 启动：
+
+```bash
+wget -qO- https://github.com/Skycnhe/Alpine-Sing-box/archive/refs/heads/Hk001.tar.gz | tar xz -C /tmp && cd /tmp/Alpine-Sing-box-Hk001 && bash sing-box-gateway-deploy.sh --install
+```
+
+> 如果系统已有 `curl`，也可用：
+> ```bash
+> curl -fsSL https://github.com/Skycnhe/Alpine-Sing-box/archive/refs/heads/Hk001.tar.gz | tar xz -C /tmp && cd /tmp/Alpine-Sing-box-Hk001 && bash sing-box-gateway-deploy.sh --install
+> ```
+
+部署完成后，脚本会自动安装 **`sb`** 快捷命令。之后直接输入 `sb` 即可打开管理菜单，无需再记脚本路径：
+
+```bash
+sb                    # 打开交互式管理菜单
+sb --update-core      # 更新 sing-box 核心
+sb --convert-apply <订阅URL>   # 转换 Clash 订阅并直接应用
+sb --help             # 查看帮助
+```
+
+管理面板地址：`http://<旁路由IP>:9999`
+
+---
+
 ## 目录
 
+- [一键安装](#一键安装)
 - [功能概览](#功能概览)
 - [架构设计](#架构设计)
 - [快速部署](#快速部署)
@@ -11,6 +38,7 @@
 - [管理面板](#管理面板)
 - [订阅转换](#订阅转换)
 - [命令行工具](#命令行工具)
+- [多仪表盘管理](#多仪表盘管理)
 - [透明网关模板收集](#透明网关模板收集)
 - [旁路由网络配置](#旁路由网络配置)
 - [目录结构](#目录结构)
@@ -67,13 +95,20 @@
 
 ## 快速部署
 
+> 如果只想一键完成，直接用[一键安装](#一键安装)命令即可。以下为手动步骤。
+
 ### 1. 将项目上传到 Alpine Linux
 
 ```bash
-# 方式一: git clone (如有仓库)
-# 方式二: scp -r sing-box-gateway/ root@<alpine-ip>:/root/
+# 方式一: git clone
+git clone -b Hk001 https://github.com/Skycnhe/Alpine-Sing-box.git
+cd Alpine-Sing-box
 
-cd sing-box-gateway
+# 方式二: 下载 tar.gz
+wget -O sb.tar.gz https://github.com/Skycnhe/Alpine-Sing-box/archive/refs/heads/Hk001.tar.gz
+tar xzf sb.tar.gz && cd Alpine-Sing-box-Hk001
+
+# 方式三: scp -r sing-box-gateway/ root@<alpine-ip>:/root/
 ```
 
 ### 2. 执行部署
@@ -81,6 +116,8 @@ cd sing-box-gateway
 ```bash
 bash sing-box-gateway-deploy.sh
 ```
+
+> 或直接用非交互模式：`bash sing-box-gateway-deploy.sh --install`
 
 脚本会自动完成：
 1. `apk add` 安装依赖（nftables / iproute2 / python3 / iptables / jq ...）
@@ -90,6 +127,7 @@ bash sing-box-gateway-deploy.sh
 5. 创建 3 个 OpenRC 服务（sing-box / singbox-panel / nftables-sing-box）
 6. 配置 IP 转发 + 加载 tproxy 内核模块
 7. 启动所有服务
+8. 安装 `sb` 快捷命令到 `/usr/local/bin/sb`
 
 ### 3. 访问面板
 
@@ -236,13 +274,13 @@ http://<旁路由IP>:9090
 **命令行**:
 ```bash
 # 转换为 sing-box JSON（默认 tproxy 模板，预览输出）
-bash sing-box-gateway-deploy.sh --convert "https://example.com/sub"
+sb --convert "https://example.com/sub"
 
 # 指定 tun 模板
-bash sing-box-gateway-deploy.sh --convert "https://example.com/sub" tun
+sb --convert "https://example.com/sub" tun
 
 # 转换并直接应用（写入 config.json + 校验 + 重启）
-bash sing-box-gateway-deploy.sh --convert-apply "https://example.com/sub" tproxy
+sb --convert-apply "https://example.com/sub" tproxy
 ```
 
 ### Clash 订阅完整支持矩阵
@@ -270,19 +308,24 @@ bash sing-box-gateway-deploy.sh --convert-apply "https://example.com/sub" tproxy
 
 ## 命令行工具
 
+部署完成后自动安装 **`sb`** 快捷命令（`/usr/local/bin/sb`），可直接使用：
+
 | 命令 | 作用 |
 |------|------|
-| `bash deploy.sh` | 交互式菜单（默认） |
-| `bash deploy.sh --install` | 完整部署（非交互） |
-| `bash deploy.sh --update-core` | 更新 sing-box 核心 |
-| `bash deploy.sh --update-panel` | 更新 Flask 管理面板 |
-| `bash deploy.sh --update-dashboard <name>` | 安装/更新仪表盘（metacubexd/zashboard/yacd） |
-| `bash deploy.sh --update-sub` | 拉取并合并所有订阅 |
-| `bash deploy.sh --convert <URL> [模板]` | 转换订阅为 sing-box JSON（预览） |
-| `bash deploy.sh --convert-apply <URL> [模板]` | 转换并应用（写入 config.json + 重启） |
-| `bash deploy.sh --status` | 查看当前配置与状态 |
-| `bash deploy.sh --uninstall` | 交互式卸载 |
-| `bash deploy.sh --help` | 显示帮助 |
+| `sb` | 交互式菜单（默认） |
+| `sb --install` | 完整部署（非交互） |
+| `sb --update-core` | 更新 sing-box 核心 |
+| `sb --update-panel` | 更新 Flask 管理面板 |
+| `sb --update-dashboard <name>` | 安装/更新仪表盘（metacubexd/zashboard/yacd） |
+| `sb --update-sub` | 拉取并合并所有订阅 |
+| `sb --convert <URL> [模板]` | 转换订阅为 sing-box JSON（预览） |
+| `sb --convert-apply <URL> [模板]` | 转换并应用（写入 config.json + 重启） |
+| `sb --install-shortcut` | 重新安装 sb 快捷命令 |
+| `sb --status` | 查看当前配置与状态 |
+| `sb --uninstall` | 交互式卸载 |
+| `sb --help` | 显示帮助 |
+
+> `sb` 等价于 `bash /opt/singbox-gateway/sing-box-gateway-deploy.sh`，所有参数原样透传。
 
 **OpenRC 服务管理**:
 ```bash
@@ -313,7 +356,7 @@ rc-update add sing-box default       # 开机自启
 
 **命令行**:
 ```bash
-bash sing-box-gateway-deploy.sh --update-dashboard metacubexd
+sb --update-dashboard metacubexd
 # 或交互菜单选 8) 面板管理
 ```
 
@@ -439,9 +482,14 @@ sing-box-gateway/
 └── .version                       # 已安装版本
 
 /opt/singbox-gateway/
+├── sing-box-gateway-deploy.sh     # 部署脚本副本 (sb 快捷命令指向此文件)
+├── templates/                     # 模板文件副本
 └── panel/
     ├── app.py                     # 面板代码
     └── venv/                      # Python 虚拟环境
+
+/usr/local/bin/
+└── sb                             # 快捷命令 (→ exec bash /opt/singbox-gateway/sing-box-gateway-deploy.sh)
 
 /etc/init.d/
 ├── sing-box                       # 核心服务
