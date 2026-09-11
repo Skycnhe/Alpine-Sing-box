@@ -1,6 +1,6 @@
 {
-  "_comment": "sing-box tproxy 透明网关模板 - 旁路由模式 (nftables/iptables redirect)",
-  "_usage": "将 LAN_SUBNET 替换为你的内网网段, TPROXY_PORT 替换为监听端口。配合 nftables 规则使用。",
+  "_comment": "sing-box tproxy 透明网关模板 - 旁路由模式 (nftables redirect) [sing-box 1.12+ 新格式]",
+  "_usage": "配合 nftables 规则使用。已迁移至 sing-box 1.12+ 新 DNS/路由格式。",
   "log": {
     "disabled": false,
     "level": "info",
@@ -10,42 +10,37 @@
   "dns": {
     "servers": [
       {
+        "type": "https",
         "tag": "remote-dns",
-        "address": "https://1.1.1.1/dns-query",
+        "server": "1.1.1.1",
         "detour": "select"
       },
       {
+        "type": "https",
         "tag": "local-dns",
-        "address": "https://223.5.5.5/dns-query",
+        "server": "223.5.5.5",
         "detour": "direct"
       },
       {
-        "tag": "block-dns",
-        "address": "rcode://success"
-      },
-      {
+        "type": "udp",
         "tag": "fallback-dns",
-        "address": "8.8.8.8",
+        "server": "8.8.8.8",
         "detour": "select"
       }
     ],
     "rules": [
       {
-        "outbound": "any",
-        "server": "local-dns"
-      },
-      {
         "rule_set": "geosite-cn",
+        "action": "route",
         "server": "local-dns"
       },
       {
         "rule_set": "geosite-category-ads-all",
-        "server": "block-dns"
+        "rcode": "SUCCESS"
       }
     ],
     "final": "remote-dns",
     "strategy": "ipv4_only",
-    "independent_cache": true,
     "reverse_mapping": true
   },
   "inbounds": [
@@ -55,10 +50,7 @@
       "listen": "::",
       "listen_port": 7893,
       "tcp_fast_open": true,
-      "udp_fragment": true,
-      "sniff": true,
-      "sniff_override_destination": true,
-      "sniff_timeout": "30s"
+      "udp_fragment": true
     },
     {
       "type": "mixed",
@@ -66,18 +58,7 @@
       "listen": "0.0.0.0",
       "listen_port": 2080,
       "tcp_fast_open": true,
-      "udp_fragment": true,
-      "sniff": true,
-      "sniff_override_destination": true
-    },
-    {
-      "type": "direct",
-      "tag": "dns-in",
-      "listen": "0.0.0.0",
-      "listen_port": 5353,
-      "network": "udp",
-      "override_address": "1.1.1.1",
-      "override_port": 53
+      "udp_fragment": true
     }
   ],
   "outbounds": [
@@ -103,21 +84,16 @@
     {
       "tag": "direct",
       "type": "direct"
-    },
-    {
-      "tag": "block",
-      "type": "block"
-    },
-    {
-      "tag": "dns-out",
-      "type": "dns"
     }
   ],
   "route": {
     "rules": [
       {
+        "action": "sniff"
+      },
+      {
         "protocol": "dns",
-        "outbound": "dns-out"
+        "action": "hijack-dns"
       },
       {
         "clash_mode": "direct",
@@ -131,7 +107,7 @@
         "rule_set": [
           "geosite-category-ads-all"
         ],
-        "outbound": "block"
+        "action": "reject"
       },
       {
         "rule_set": [
@@ -176,7 +152,10 @@
       }
     ],
     "auto_detect_interface": true,
-    "final": "select"
+    "final": "select",
+    "default_domain_resolver": {
+      "server": "local-dns"
+    }
   },
   "experimental": {
     "cache_file": {
