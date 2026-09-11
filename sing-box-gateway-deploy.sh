@@ -11,7 +11,8 @@
 #    6. OpenRC 服务管理 (sing-box + panel)
 #
 #  用法:
-#    bash sing-box-gateway-deploy.sh              # 完整部署
+#    bash sing-box-gateway-deploy.sh              # 交互式菜单 (默认)
+#    bash sing-box-gateway-deploy.sh --install    # 完整部署 (非交互)
 #    bash sing-box-gateway-deploy.sh --update-core     # 仅更新核心
 #    bash sing-box-gateway-deploy.sh --update-panel    # 仅更新面板
 #    bash sing-box-gateway-deploy.sh --update-sub      # 更新订阅
@@ -550,6 +551,8 @@ ${GREEN}╚═══════════════════════
     5. 在主路由 DHCP 中将网关/DNS 指向本机 IP
 
   命令行工具:
+    bash $0                     交互式菜单
+    bash $0 --install           完整部署
     bash $0 --update-core        更新核心
     bash $0 --update-panel       更新面板
     bash $0 --update-sub         更新订阅
@@ -559,27 +562,260 @@ ${GREEN}╚═══════════════════════
 EOF
 }
 
+# ============================================================
+#  交互式菜单
+# ============================================================
+
+# ---- 读取核心版本 ----
+get_core_version() {
+    if [ -x "$SB_BIN" ] && [ -f "$SB_VERSION_FILE" ]; then
+        echo "v$(cat "$SB_VERSION_FILE")"
+    elif [ -x "$SB_BIN" ]; then
+        "$SB_BIN" version 2>/dev/null | grep -oiE 'sing-box version [^ ]+' | awk '{print $3}' | sed 's/^/v/' || echo "未知"
+    else
+        echo "未安装"
+    fi
+}
+
+# ---- 服务状态字符串 ----
+svc_status() {
+    local svc="$1"
+    if rc-service "$svc" status >/dev/null 2>&1; then
+        echo -e "${GREEN}运行中${NC}"
+    else
+        echo -e "${RED}已停止${NC}"
+    fi
+}
+
+# ---- 节点计数 ----
+node_count() {
+    if [ -f "$SB_CONFIG" ] && command -v jq >/dev/null 2>&1; then
+        jq '[.outbounds[] | select(.type|test("shadowsocks|vmess|vless|trojan|hysteria2|tuic"))] | length' "$SB_CONFIG" 2>/dev/null || echo "0"
+    else
+        echo "0"
+    fi
+}
+
+# ---- 状态头 ----
+show_status_header() {
+    local ip_addr
+    ip_addr="$(ip -4 addr show scope global 2>/dev/null | grep inet | awk '{print $2}' | head -1 | cut -d/ -f1)"
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║        sing-box 旁路由网关管理 (Alpine Linux)            ║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════╝${NC}"
+    echo -e "  本机 IP:     ${ip_addr:-未知}"
+    echo -e "  核心版本:   $(get_core_version)"
+    echo -e "  sing-box:   $(svc_status sing-box)    面板: $(svc_status singbox-panel)"
+    echo -e "  节点数量:    $(node_count)    面板地址: http://${ip_addr:-<IP>}:9999"
+    echo ""
+}
+
+# ---- 服务控制子菜单 ----
+menu_service_control() {
+    while true; do
+        echo -e "\n${CYAN}── 服务管理 ──${NC}"
+        echo "  1) 启动 sing-box        2) 停止 sing-box        3) 重启 sing-box"
+        echo "  4) 启动面板             5) 停止面板             6) 重启面板"
+        echo "  7) 启动 nftables网关    8) 停止 nftables网关    9) 重启 nftables网关"
+        echo "  s) 全部启动             t) 全部停止             r) 全部重启"
+        echo "  0) 返回主菜单"
+        read -r -p "选择 [0-9/s/t/r]: " c
+        case "$c" in
+            1) rc-service sing-box start 2>&1 || true ;;
+            2) rc-service sing-box stop 2>&1 || true ;;
+            3) rc-service sing-box restart 2>&1 || true ;;
+            4) rc-service singbox-panel start 2>&1 || true ;;
+            5) rc-service singbox-panel stop 2>&1 || true ;;
+            6) rc-service singbox-panel restart 2>&1 || true ;;
+            7) rc-service nftables-sing-box start 2>&1 || true ;;
+            8) rc-service nftables-sing-box stop 2>&1 || true ;;
+            9) rc-service nftables-sing-box restart 2>&1 || true ;;
+            s|S) rc-service sing-box start 2>&1; rc-service singbox-panel start 2>&1; rc-service nftables-sing-box start 2>&1 || true ;;
+            t|T) rc-service nftables-sing-box stop 2>&1; rc-service singbox-panel stop 2>&1; rc-service sing-box stop 2>&1 || true ;;
+            r|R) rc-service sing-box restart 2>&1; rc-service singbox-panel restart 2>&1; rc-service nftables-sing-box restart 2>&1 || true ;;
+            0|'') return 0 ;;
+            *) warn "无效选项" ;;
+        esac
+        read -r -p "按回车继续..." _
+    done
+}
+
+# ---- 网关模式子菜单 ----
+menu_setup_gateway() {
+    while true; do
+        echo -e "\n${CYAN}── 配置透明网关 ──${NC}"
+        echo "  1) tproxy 模式  (旁路由推荐, 需 nftables 规则 + 路由表)"
+        echo "  2) TUN 模式     (sing-box 自管路由, 无需防火墙规则, 最简单)"
+        echo "  3) Mixed 模式  (仅 HTTP/SOCKS5 代理, 不做透明网关)"
+        echo "  4) 应用 tproxy nftables 规则 (加载 fwmark + 路由表 100)"
+        echo "  5) 清除 tproxy nftables 规则"
+        echo "  0) 返回主菜单"
+        read -r -p "选择 [0-5]: " c
+        case "$c" in
+            1|2|3)
+                local tpl
+                case "$c" in 1) tpl="tproxy";; 2) tpl="tun";; 3) tpl="mixed";; esac
+                if [ ! -f "${SB_TEMPLATES_DIR}/config-${tpl}.json" ]; then
+                    error "模板不存在: config-${tpl}.json (先重新安装配置)"
+                    continue
+                fi
+                info "切换到 ${tpl} 模式 (备份当前配置)"
+                [ -f "$SB_CONFIG" ] && cp "$SB_CONFIG" "$SB_CONFIG_BACKUP"
+                jq 'del(._comment,._usage,_usage_tproxy,_usage_tun,_usage_mixed)' \
+                   "${SB_TEMPLATES_DIR}/config-${tpl}.json" > "$SB_CONFIG" 2>/dev/null \
+                   || cp "${SB_TEMPLATES_DIR}/config-${tpl}.json" "$SB_CONFIG"
+                # 记录模式
+                if [ -f "$PANEL_CONFIG" ]; then
+                    jq --arg m "$tpl" '.gateway_mode=$m' "$PANEL_CONFIG" > "$PANEL_CONFIG.tmp" && mv "$PANEL_CONFIG.tmp" "$PANEL_CONFIG"
+                fi
+                info "${GREEN}已切换为 ${tpl} 模式, 正在重启 sing-box...${NC}"
+                rc-service sing-box restart 2>&1 || warn "sing-box 重启失败, 请检查配置"
+                if [ "$tpl" = "tproxy" ]; then
+                    warn "tproxy 模式需执行选项 4 加载 nftables 规则才能生效"
+                fi
+                ;;
+            4)
+                if [ ! -f "$NFT_RULES" ]; then
+                    error "nftables 规则文件不存在: $NFT_RULES"
+                    continue
+                fi
+                info "加载 nftables 规则..."
+                modprobe nft_tproxy 2>/dev/null || true
+                modprobe xt_TPROXY 2>/dev/null || true
+                nft -f "$NFT_RULES" 2>/dev/null || error "nft 加载失败"
+                ip route add local default dev lo table 100 2>/dev/null || info "路由表 100 已存在"
+                ip rule add fwmark 1 table 100 2>/dev/null || info "fwmark 规则已存在"
+                info "${GREEN}tproxy 规则已加载${NC}"
+                rc-service nftables-sing-box restart 2>/dev/null || true
+                ;;
+            5)
+                info "清除 nftables 规则..."
+                nft delete table ip sing-box 2>/dev/null || true
+                ip route del local default dev lo table 100 2>/dev/null || true
+                ip rule del fwmark 1 table 100 2>/dev/null || true
+                info "${GREEN}已清除 tproxy 规则${NC}"
+                ;;
+            0|'') return 0 ;;
+            *) warn "无效选项" ;;
+        esac
+        read -r -p "按回车继续..." _
+    done
+}
+
+# ---- 显示当前配置信息 ----
+show_info() {
+    step "当前配置信息"
+    local ip_addr
+    ip_addr="$(ip -4 addr show scope global 2>/dev/null | grep inet | awk '{print $2}' | head -1 | cut -d/ -f1)"
+    echo -e "  核心版本:    $(get_core_version)"
+    echo -e "  核心二进制:  ${SB_BIN}"
+    echo -e "  核心配置:    ${SB_CONFIG}"
+    echo -e "  配置备份:    ${SB_CONFIG_BACKUP}"
+    echo -e "  模板目录:    ${SB_TEMPLATES_DIR}"
+    echo -e "  订阅文件:    ${SUBS_FILE}"
+    echo -e "  面板配置:    ${PANEL_CONFIG}"
+    echo -e "  面板代码:    ${PANEL_APP}"
+    echo -e "  nft 规则:    ${NFT_RULES}"
+    echo -e "  节点数量:    $(node_count)"
+    echo ""
+    echo -e "  服务状态:"
+    echo -e "    sing-box:        $(svc_status sing-box)"
+    echo -e "    singbox-panel:   $(svc_status singbox-panel)"
+    echo -e "    nftables网关:    $(svc_status nftables-sing-box)"
+    echo ""
+    echo -e "  访问地址:"
+    echo -e "    管理面板:   http://${ip_addr:-<IP>}:9999"
+    echo -e "    Clash API:  http://${ip_addr:-<IP>}:9090"
+    echo ""
+    if [ -f "$PANEL_CONFIG" ]; then
+        echo -e "  面板配置项:"
+        jq '.' "$PANEL_CONFIG" 2>/dev/null | sed 's/^/    /'
+    fi
+}
+
+# ---- 查看实时日志 ----
+show_logs() {
+    echo -e "\n${CYAN}── 日志查看 (Ctrl+C 退出) ──${NC}"
+    echo "  1) sing-box 日志     2) 面板日志     3) nftables 流量"
+    echo "  0) 返回"
+    read -r -p "选择 [0-3]: " c
+    case "$c" in
+        1) tail -n 100 -f "${LOG_DIR}/sing-box-stderr.log" 2>/dev/null || error "日志文件不存在" ;;
+        2) tail -n 100 -f "${LOG_DIR}/panel-stderr.log" 2>/dev/null || error "日志文件不存在" ;;
+        3) nft monitor 2>/dev/null || error "nft monitor 不可用" ;;
+        0|'') return 0 ;;
+    esac
+}
+
+# ---- 主菜单循环 ----
+main_menu() {
+    while true; do
+        clear 2>/dev/null || true
+        show_status_header
+        echo -e "${CYAN}请选择操作:${NC}"
+        echo "  1)  完整安装      (首次部署: 依赖+核心+面板+服务+配置+内核)"
+        echo "  2)  仅安装/更新核心"
+        echo "  3)  仅安装/更新面板"
+        echo "  4)  更新所有订阅  (拉取+合并节点到 config.json)"
+        echo "  5)  转换订阅      (输入订阅URL, 输出 sing-box 配置)"
+        echo "  6)  服务管理      (启动/停止/重启 各服务)"
+        echo "  7)  配置透明网关  (切换 tproxy/TUN/Mixed + nftables 规则)"
+        echo "  8)  查看配置信息"
+        echo "  9)  查看日志"
+        echo " 10)  卸载"
+        echo "  0)  退出"
+        echo ""
+        read -r -p "请选择 [0-10]: " choice
+        case "$choice" in
+            1)  full_install ;;
+            2)  do_update_core ;;
+            3)  do_update_panel ;;
+            4)  do_update_sub ;;
+            5)  read -r -p "订阅URL: " su; read -r -p "模板(tproxy/tun/mixed) [tproxy]: " tp; do_convert "$su" "${tp:-tproxy}" ;;
+            6)  menu_service_control ;;
+            7)  menu_setup_gateway ;;
+            8)  show_info ;;
+            9)  show_logs ;;
+            10) do_uninstall ;;
+            0|"") echo "再见"; exit 0 ;;
+            *) warn "无效选项: $choice" ;;
+        esac
+        echo ""
+        read -r -p "按回车返回菜单 (Ctrl+C 退出)..." _
+    done
+}
+
 # ==================== 主入口 ====================
 main() {
     case "${1:-}" in
-        --update-core)    do_update_core ;;
-        --update-panel)   do_update_panel ;;
-        --update-sub)     do_update_sub ;;
-        --convert)        do_convert "${2:-}" "${3:-tproxy}" ;;
-        --uninstall)      do_uninstall ;;
-        --help|-h|"")
+        --menu|-m)       main_menu ;;
+        --install|--full) full_install ;;
+        --update-core)  do_update_core ;;
+        --update-panel) do_update_panel ;;
+        --update-sub)   do_update_sub ;;
+        --convert)      do_convert "${2:-}" "${3:-tproxy}" ;;
+        --status)       show_info ;;
+        --uninstall)    do_uninstall ;;
+        --help|-h)
             cat << 'HELPEOF'
 sing-box 旁路由网关部署脚本 (Alpine Linux)
 
 用法:
-  bash $0                      完整部署 (安装核心+面板+服务+配置)
-  bash $0 --update-core        仅更新 sing-box 核心
+  bash $0                       交互式菜单 (默认)
+  bash $0 --menu                交互式菜单
+  bash $0 --install             完整部署 (非交互, 核心+面板+服务+配置)
+  bash $0 --update-core         仅更新 sing-box 核心
   bash $0 --update-panel       仅更新管理面板
   bash $0 --update-sub         更新所有订阅并合并节点
   bash $0 --convert <URL> [模板]  转换订阅为 sing-box JSON
                                   模板: tproxy / tun / mixed
+  bash $0 --status              查看当前配置与状态
   bash $0 --uninstall          卸载 (交互式确认)
   bash $0 --help               显示此帮助
+
+菜单功能 (交互模式):
+  1 完整安装  2 更新核心  3 更新面板  4 更新订阅  5 转换订阅
+  6 服务管理  7 配置网关  8 查看信息  9 查看日志  10 卸载
 
 模板说明:
   config-tproxy.json  tproxy 透明网关 (需 nftables 规则, 推荐旁路由)
@@ -588,13 +824,8 @@ sing-box 旁路由网关部署脚本 (Alpine Linux)
 HELPEOF
             ;;
         *)
-            # 无参数 = 完整安装
-            if [ $# -eq 0 ]; then
-                full_install
-            else
-                error "未知参数: $1"
-                exit 1
-            fi
+            # 无参数 = 默认进入交互式菜单
+            main_menu
             ;;
     esac
 }
