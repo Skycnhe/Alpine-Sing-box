@@ -4,8 +4,8 @@
 #  ============================================================
 #  功能:
 #    1. 自动安装所有依赖 (nftables / iproute2 / python3 / flask ...)
-#    2. 下载并安装 sing-box 核心
-#    3. 部署 Web 管理面板 (Flask, 内置订阅解析/转换)
+#    2. 自动识别架构 (12+) + 按架构匹配下载 sing-box 核心
+#    3. 自动下载/更新管理面板 (优先 GitHub 仓库, 回退本地)
 #    4. 配置透明网关 (tproxy / tun 两种模式)
 #    5. 一键更新: 核心 / 面板 / 订阅 / 订阅转换
 #    6. OpenRC 服务管理 (sing-box + panel)
@@ -55,18 +55,45 @@ SB_VERSION_FILE="${SB_DIR}/.version"
 # ==================== GitHub 资源 ====================
 SB_REPO="SagerNet/sing-box"
 SB_API="https://api.github.com/repos/${SB_REPO}/releases/latest"
+# 面板代码来源 (改成你自己的仓库; 为空则只用本地 panel/app.py)
+PANEL_REPO="Skycnhe/Alpine-Sing-box"
+PANEL_BRANCH="Hk001"
 
 # ==================== 检测架构 ====================
+# 输出 goarch: amd64/arm64/armv7/armv6/armv5/386/mipsle/mips/mips64/s390x/riscv64/ppc64le
 detect_arch() {
     local arch
     arch="$(uname -m)"
     case "$arch" in
-        x86_64)  echo "linux-amd64" ;;
-        aarch64) echo "linux-arm64" ;;
-        armv7l)  echo "linux-armv7" ;;
-        armhf)   echo "linux-armv7" ;;
-        *)       echo "linux-amd64"; warn "未知架构 $arch, 默认使用 amd64" ;;
+        x86_64|amd64)          echo "amd64" ;;
+        aarch64|arm64)        echo "arm64" ;;
+        armv7l|armv7)         echo "armv7" ;;
+        armv6l|armv6)         echo "armv6" ;;
+        armv5tel|armv5)       echo "armv5" ;;
+        armhf)                echo "armv7" ;;
+        i386|i686)            echo "386" ;;
+        mipsle|mipsel)        echo "mipsle" ;;
+        mips)                echo "mips" ;;
+        mips64|mips64el)      echo "mips64" ;;
+        s390x)               echo "s390x" ;;
+        riscv64)             echo "riscv64" ;;
+        ppc64le|powerpc64le)  echo "ppc64le" ;;
+        *) echo "amd64"; warn "未知架构 $arch, 默认使用 amd64" ;;
     esac
+}
+
+# ==================== 检测 libc (musl/glibc) ====================
+# Alpine 用 musl; 选包时必须匹配对应 libc 变体, 否则二进制无法运行
+detect_libc() {
+    if ldd --version 2>&1 | head -1 | grep -qi musl; then
+        echo "musl"
+    elif ldd --version 2>&1 | head -1 | grep -qi 'glibc\|GNU\|2\.[0-9]'; then
+        echo "glibc"
+    elif grep -qi alpine /etc/os-release 2>/dev/null; then
+        echo "musl"
+    else
+        echo "glibc"
+    fi
 }
 
 # ==================== 检测 OS ====================
@@ -97,39 +124,93 @@ install_deps() {
     info "依赖安装完成"
 }
 
+# ==================== 获取最新发布信息 ====================
+# 从 GitHub API 取最新 release; stdout 第一行 tag_name, 其余每行 "name<TAB>url"
+get_latest_release() {
+    local resp
+    resp="$(curl -sL --connect-timeout 30 --max-time 60 "${SB_API}")"
+    local tag
+    tag="$(echo "$resp" | jq -r '.tag_name // empty' 2>/dev/null)"
+    [ -z "$tag" ] && return 1
+    echo "$tag"
+    echo "$resp" | jq -r '.assets[] | .name + "\t" + .browser_download_url' 2>/dev/null
+}
+
+# ==================== 按架构+libc 选择核心下载资源 ====================
+# $1 = goarch, $2 = libc(musl/glibc); 从 stdin 读取 "name<TAB>url" 列表, stdout 输出匹配 url
+select_core_asset() {
+    local goarch="$1" libc="${2:-}"
+    local lines=() name url line
+    # 一次性读入 stdin 到数组 (避免多个 while 循环互相消耗 stdin)
+    while IFS=$'\t' read -r name url; do
+        [ -n "$name" ] && lines+=("${name}"$'\t'"${url}")
+    done
+    # 1) 优先匹配对应 libc 变体 (musl/glibc): linux-${goarch}-${libc}
+    if [ -n "$libc" ]; then
+        for line in "${lines[@]}"; do
+            name="${line%%$'\t'*}"; url="${line#*$'\t'}"
+            echo "$name" | grep -qiE "linux[-_]${goarch}[-_]${libc}([.\\-]|$)" && { echo "$url"; return 0; }
+        done
+    fi
+    # 2) 裸变体 (无 -glibc/-musl 后缀): linux-${goarch}.tar.gz
+    for line in "${lines[@]}"; do
+        name="${line%%$'\t'*}"; url="${line#*$'\t'}"
+        echo "$name" | grep -qiE "linux[-_]${goarch}\." && { echo "$url"; return 0; }
+    done
+    # 3) 模糊兜底: 任意 linux-${goarch} 变体 (可能 libc 不符, 仅最后手段)
+    for line in "${lines[@]}"; do
+        name="${line%%$'\t'*}"; url="${line#*$'\t'}"
+        echo "$name" | grep -qiE "linux[-_]${goarch}([.\\-]|$)" && { echo "$url"; return 0; }
+    done
+    return 1
+}
+
 # ==================== 下载安装 sing-box 核心 ====================
 install_core() {
     step "安装 sing-box 核心"
 
-    local goarch
+    local goarch libc
     goarch="$(detect_arch)"
-    info "架构: $goarch"
+    libc="$(detect_libc)"
+    info "检测架构: ${goarch} | libc: ${libc} (关键词 linux-${goarch}-${libc})"
 
-    # 获取最新版本
+    # 获取最新发布
     info "获取最新版本..."
-    local latest
-    latest="$(curl -sL "${SB_API}" | jq -r '.tag_name // empty')"
-    if [ -z "$latest" ]; then
-        error "无法获取最新版本, 请检查网络"
+    local release_out tag assets
+    if ! release_out="$(get_latest_release)"; then
+        error "无法获取最新版本, 请检查网络或 GitHub API 限流"
         return 1
     fi
-    local ver="${latest#v}"
-    info "最新版本: ${latest} (v${ver})"
+    tag="$(echo "$release_out" | head -1)"
+    assets="$(echo "$release_out" | tail -n +2)"
+    local ver="${tag#v}"
+    info "最新版本: ${tag} (v${ver})"
+
+    # 按架构+libc 匹配资源 URL
+    local dl_url
+    dl_url="$(echo "$assets" | select_core_asset "$goarch" "$libc")"
+    if [ -z "$dl_url" ]; then
+        warn "未找到匹配 ${goarch}/${libc} 的资源, 可用资源:"
+        echo "$assets" | while IFS=$'\t' read -r name _; do [ -n "$name" ] && echo "    $name"; done
+        error "无匹配预编译核心"
+        return 1
+    fi
+    local dl_name; dl_name="$(basename "$dl_url")"
+    info "匹配资源: ${dl_name} (${libc}版)"
 
     # 下载
     local tmp_file="/tmp/sing-box-${ver}.tar.gz"
-    local dl_url="https://github.com/${SB_REPO}/releases/download/${latest}/sing-box-${ver}-${goarch}.tar.gz"
     info "下载: ${dl_url}"
-    if ! curl -L --fail --connect-timeout 30 -o "$tmp_file" "$dl_url"; then
+    if ! curl -L --fail --connect-timeout 30 --max-time 300 -o "$tmp_file" "$dl_url"; then
         error "下载失败"
         return 1
     fi
 
     # 解压
     local extract_dir="/tmp/sing-box-${ver}"
-    rm -rf "$extract_dir"
-    mkdir -p "$extract_dir"
-    tar xzf "$tmp_file" -C "$extract_dir"
+    rm -rf "$extract_dir"; mkdir -p "$extract_dir"
+    tar xzf "$tmp_file" -C "$extract_dir" 2>/dev/null \
+        || gzip -dc "$tmp_file" | tar x -C "$extract_dir"
 
     # 找到二进制
     local bin_path
@@ -207,30 +288,56 @@ EOF
     info "  订阅文件: ${SUBS_FILE}"
 }
 
-# ==================== 安装管理面板 ====================
+# ==================== 下载/安装管理面板 ====================
+# 面板来源: 优先从 GitHub 仓库下载最新 panel/app.py, 失败回退到本地
 install_panel() {
     step "安装 Web 管理面板"
 
     mkdir -p "$INSTALL_DIR" "$PANEL_DIR"
 
-    # 复制面板代码
-    if [ -f "${SCRIPT_DIR}/panel/app.py" ]; then
-        info "从本地安装面板代码..."
-        cp -f "${SCRIPT_DIR}/panel/app.py" "$PANEL_APP"
-    elif [ -f "$PANEL_APP" ]; then
-        info "面板代码已存在, 保留"
-    else
-        error "找不到面板代码 (panel/app.py)"
-        return 1
+    local panel_src_ok=no
+
+    # 1) 尝试从 GitHub 仓库下载最新面板代码
+    if [ -n "${PANEL_REPO:-}" ] && [ -n "${PANEL_BRANCH:-}" ]; then
+        local raw_base="https://raw.githubusercontent.com/${PANEL_REPO}/${PANEL_BRANCH}/panel"
+        info "从 GitHub 下载面板代码: ${PANEL_REPO}@${PANEL_BRANCH}"
+        if curl -sL --fail --connect-timeout 20 --max-time 60 -o "$PANEL_APP.tmp" "${raw_base}/app.py"; then
+            # 校验: 必须像 Python 文件 (排除 404 HTML 页面)
+            if grep -qE '^(from |import |def |app\s*=|Flask\(|@app\.route)' "$PANEL_APP.tmp" 2>/dev/null; then
+                mv "$PANEL_APP.tmp" "$PANEL_APP"
+                chmod 644 "$PANEL_APP"
+                info "${GREEN}面板代码已从 GitHub 更新${NC}"
+                panel_src_ok=yes
+            else
+                warn "GitHub 返回内容不像 Python 文件 (路径不存在?), 回退本地"
+                rm -f "$PANEL_APP.tmp"
+            fi
+        else
+            warn "GitHub 下载失败 (仓库/分支/路径不存在?), 回退本地"
+            rm -f "$PANEL_APP.tmp"
+        fi
     fi
 
-    # 创建虚拟环境
+    # 2) 回退: 本地 panel/app.py
+    if [ "$panel_src_ok" != "yes" ]; then
+        if [ -f "${SCRIPT_DIR}/panel/app.py" ]; then
+            info "使用本地面板代码..."
+            cp -f "${SCRIPT_DIR}/panel/app.py" "$PANEL_APP"
+            panel_src_ok=yes
+        elif [ -f "$PANEL_APP" ]; then
+            info "本地无源码, 保留已安装的面板"
+            panel_src_ok=yes
+        else
+            error "找不到面板代码 (GitHub 和本地均无 panel/app.py)"
+            return 1
+        fi
+    fi
+
+    # 3) Python 虚拟环境 + 依赖 (pip 自动按架构选 wheel, 无需手动处理)
     if [ ! -d "$PANEL_VENV" ]; then
         info "创建 Python 虚拟环境..."
         python3 -m venv "$PANEL_VENV"
     fi
-
-    # 安装 Python 依赖
     info "安装 Python 依赖 (flask, requests, pyyaml)..."
     "$PANEL_VENV/bin/pip" install --quiet --upgrade pip
     "$PANEL_VENV/bin/pip" install --quiet flask requests pyyaml
