@@ -26,6 +26,8 @@ sb --help             # 查看帮助
 
 管理面板地址：`http://<旁路由IP>:9999`
 
+> **Clash API 后端密钥**: `singbox-gateway`（连接仪表盘时填入）
+
 ---
 
 ## 目录
@@ -233,6 +235,9 @@ ip rule add fwmark 1 table 100
 
 面板地址: `http://<旁路由IP>:9999`
 
+> **Clash API 后端地址**: `http://<旁路由IP>:9090`
+> **Clash API 密钥 (Secret)**: `singbox-gateway`
+
 ### 功能页面
 
 | 页面 | 功能 |
@@ -247,11 +252,14 @@ ip rule add fwmark 1 table 100
 
 ### Clash API
 
-所有模板均开启了 sing-box 内置 Clash API (`0.0.0.0:9090`)，可配合 [yacd](https://yacd.haishan.me) / [metacubexd](https://d.metacubex.one) 等面板实时切换节点：
+所有模板均开启了 sing-box 内置 Clash API (`0.0.0.0:9090`)，并设置了后端密钥。可配合 [yacd](https://yacd.haishan.me) / [metacubexd](https://d.metacubex.one) 等面板实时切换节点：
 
-```
-http://<旁路由IP>:9090
-```
+| 配置项 | 值 |
+|--------|-----|
+| **后端地址 (Host)** | `http://<旁路由IP>:9090` |
+| **密钥 (Secret)** | `singbox-gateway` |
+
+> 密钥定义在 `config.json` 的 `experimental.clash_api.secret` 字段。如需修改，编辑该字段后 `rc-service sing-box restart`。
 
 ---
 
@@ -360,7 +368,12 @@ sb --update-dashboard metacubexd
 # 或交互菜单选 8) 面板管理
 ```
 
-安装后访问 `http://<旁路由IP>:9999/ui/` 自动跳转到当前活动仪表盘。首次使用在仪表盘设置中填入后端地址 `http://<旁路由IP>:9090`（sing-box Clash API）即可连接节点、切换代理、查看连接。
+安装后访问 `http://<旁路由IP>:9999/ui/` 自动跳转到当前活动仪表盘。首次使用在仪表盘设置中填入：
+
+| 配置项 | 值 |
+|--------|-----|
+| **后端地址 (Host)** | `http://<旁路由IP>:9090` |
+| **密钥 (Secret)** | `singbox-gateway` |
 
 ---
 
@@ -548,9 +561,11 @@ rc-service singbox-panel restart
 
 ### Q: 如何使用 Clash 面板切换节点？
 
-所有模板已开启 Clash API (`:9090`)，访问:
-- [yacd 面板](https://yacd.haishan.me) → 填入 `http://<IP>:9090`
-- [metacubexd](https://d.metacubex.one) → 填入 `http://<IP>:9090`
+所有模板已开启 Clash API (`:9090`)，并设置了后端密钥 `singbox-gateway`。访问:
+- [yacd 面板](https://yacd.haishan.me) → 填入 `http://<IP>:9090`，密钥 `singbox-gateway`
+- [metacubexd](https://d.metacubex.one) → 填入 `http://<IP>:9090`，密钥 `singbox-gateway`
+
+> 也可直接用内置仪表盘：`http://<旁路由IP>:9999/ui/`，首次打开同样填后端地址 + 密钥。
 
 ---
 
