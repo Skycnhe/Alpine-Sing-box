@@ -12,6 +12,7 @@
 #    7. OpenRC 服务管理 (sing-box + panel)
 #
 #  用法:
+#    sb                            # 交互式菜单 (快捷命令, 安装后可用)
 #    bash sing-box-gateway-deploy.sh              # 交互式菜单 (默认)
 #    bash sing-box-gateway-deploy.sh --install    # 完整部署 (非交互)
 #    bash sing-box-gateway-deploy.sh --update-core     # 仅更新核心
@@ -20,6 +21,7 @@
 #    bash sing-box-gateway-deploy.sh --update-sub      # 更新订阅
 #    bash sing-box-gateway-deploy.sh --convert <URL>  # 转换订阅(预览)
 #    bash sing-box-gateway-deploy.sh --convert-apply <URL>  # 转换并应用
+#    bash sing-box-gateway-deploy.sh --install-shortcut  # 安装 sb 快捷命令
 #    bash sing-box-gateway-deploy.sh --uninstall       # 卸载
 #
 #  作者: WorkBuddy | 适配 Alpine Linux 3.18+
@@ -433,6 +435,65 @@ CONFEOF
     info "服务文件已创建"
 }
 
+# ==================== 安装快捷命令 sb ====================
+# 将部署脚本复制到 /opt/singbox-gateway/ 并创建 /usr/local/bin/sb 包装器
+# 安装后用户可直接输入 sb 打开管理菜单, 无需记脚本路径
+install_shortcut() {
+    step "安装快捷命令 sb"
+
+    local target_dir="/opt/singbox-gateway"
+    local target_script="${target_dir}/sing-box-gateway-deploy.sh"
+    local sb_link="/usr/local/bin/sb"
+
+    mkdir -p "$target_dir"
+
+    # 1) 复制部署脚本本身到安装目录 (使 sb 始终能找到它)
+    local script_path
+    script_path="${SCRIPT_DIR}/$(basename "$0")"
+    [ -f "$script_path" ] || script_path="$0"
+    if [ "$(readlink -f "$script_path" 2>/dev/null || echo "$script_path")" != "$(readlink -f "$target_script" 2>/dev/null || echo "$target_script")" ]; then
+        info "复制部署脚本到 ${target_script}..."
+    fi
+    cp -f "$script_path" "$target_script" 2>/dev/null || cp -f "$0" "$target_script" 2>/dev/null || true
+    chmod +x "$target_script"
+
+    # 2) 复制模板目录 (供后续 sb --install 的 install_configs 使用)
+    if [ -d "${SCRIPT_DIR}/templates" ] && [ "${SCRIPT_DIR}" != "${target_dir}" ]; then
+        info "复制模板文件到 ${target_dir}/templates/..."
+        cp -rf "${SCRIPT_DIR}/templates" "${target_dir}/"
+    fi
+
+    # 3) 复制面板源码 (供后续 sb --update-panel 的本地回退使用)
+    if [ -f "${SCRIPT_DIR}/panel/app.py" ] && [ "${SCRIPT_DIR}" != "${target_dir}" ]; then
+        mkdir -p "${target_dir}/panel"
+        cp -f "${SCRIPT_DIR}/panel/app.py" "${target_dir}/panel/"
+    fi
+
+    # 4) 创建 sb 快捷命令
+    info "创建快捷命令: sb → ${target_script}"
+    cat > "$sb_link" << 'SHORTCUTEOF'
+#!/bin/sh
+# sb - sing-box 旁路由网关快捷命令
+# 用法:
+#   sb                 交互式菜单
+#   sb --install       完整部署
+#   sb --update-core   更新核心
+#   sb --update-panel  更新面板
+#   sb --convert-apply <URL>  转换并应用订阅
+#   sb --help          查看帮助
+exec bash /opt/singbox-gateway/sing-box-gateway-deploy.sh "$@"
+SHORTCUTEOF
+    chmod +x "$sb_link"
+
+    # 5) 检查 PATH
+    if echo "$PATH" | grep -q "/usr/local/bin"; then
+        info "${GREEN}快捷命令已安装: 直接输入 sb 即可打开管理菜单${NC}"
+    else
+        warn "快捷命令已安装到 ${sb_link}, 但 /usr/local/bin 不在 PATH 中"
+        warn "请手动添加: export PATH=\$PATH:/usr/local/bin"
+    fi
+}
+
 # ==================== 配置内核参数 ====================
 setup_kernel() {
     step "配置内核参数 (IP 转发)"
@@ -791,6 +852,7 @@ do_uninstall() {
         rm -f /etc/init.d/sing-box /etc/init.d/singbox-panel /etc/init.d/nftables-sing-box
         rm -f /etc/conf.d/sing-box /etc/conf.d/singbox-panel
         rm -f "$SB_BIN"
+        rm -f /usr/local/bin/sb
         rm -rf "$SB_DIR" "$INSTALL_DIR" "$LOG_DIR"
         rm -f /etc/sysctl.d/99-sing-box.conf
         rm -f "$NFT_RULES"
@@ -800,6 +862,7 @@ do_uninstall() {
         rm -f /etc/init.d/sing-box /etc/init.d/singbox-panel /etc/init.d/nftables-sing-box
         rm -f /etc/conf.d/sing-box /etc/conf.d/singbox-panel
         rm -f "$SB_BIN"
+        rm -f /usr/local/bin/sb
     fi
 }
 
@@ -814,6 +877,7 @@ full_install() {
     setup_kernel
     setup_nftables_service
     start_services
+    install_shortcut
 
     step "部署完成"
     local ip_addr
@@ -845,13 +909,14 @@ ${GREEN}╚═══════════════════════
     5. 在主路由 DHCP 中将网关/DNS 指向本机 IP
 
   命令行工具:
-    bash $0                     交互式菜单
-    bash $0 --install           完整部署
-    bash $0 --update-core        更新核心
-    bash $0 --update-panel       更新面板
-    bash $0 --update-sub         更新订阅
-    bash $0 --convert <URL>      转换订阅
-    bash $0 --uninstall          卸载
+    sb                           快捷打开管理菜单 (推荐)
+    sb --install                 完整部署
+    sb --update-core              更新核心
+    sb --update-panel             更新面板
+    sb --update-sub               更新订阅
+    sb --convert-apply <URL>      转换并应用订阅
+    sb --uninstall                卸载
+    bash $0                       (等价于 sb)
 
 EOF
 }
@@ -1053,6 +1118,13 @@ show_info() {
     echo -e "    singbox-panel:   $(svc_status singbox-panel)"
     echo -e "    nftables网关:    $(svc_status nftables-sing-box)"
     echo ""
+    # sb 快捷命令状态
+    if [ -x /usr/local/bin/sb ]; then
+        echo -e "  快捷命令:    ${GREEN}sb 已安装${NC} (直接输入 sb 打开菜单)"
+    else
+        echo -e "  快捷命令:    ${YELLOW}sb 未安装${NC} (选菜单 12 或 --install-shortcut 安装)"
+    fi
+    echo ""
     echo -e "  访问地址:"
     echo -e "    管理面板:   http://${ip_addr:-<IP>}:9999"
     echo -e "    Clash API:  http://${ip_addr:-<IP>}:9090"
@@ -1094,9 +1166,10 @@ main_menu() {
         echo "  9)  查看配置信息"
         echo " 10)  查看日志"
         echo " 11)  卸载"
+        echo " 12)  安装快捷命令 sb  (安装后直接输入 sb 打开菜单)"
         echo "  0)  退出"
         echo ""
-        read -r -p "请选择 [0-11]: " choice
+        read -r -p "请选择 [0-12]: " choice
         case "$choice" in
             1)  full_install ;;
             2)  do_update_core ;;
@@ -1109,6 +1182,7 @@ main_menu() {
             9)  show_info ;;
             10) show_logs ;;
             11) do_uninstall ;;
+            12) install_shortcut ;;
             0|"") echo "再见"; exit 0 ;;
             *) warn "无效选项: $choice" ;;
         esac
@@ -1128,30 +1202,41 @@ main() {
         --update-sub)   do_update_sub ;;
         --convert)      do_convert "${2:-}" "${3:-tproxy}" ;;
         --convert-apply) do_convert_apply "${2:-}" "${3:-tproxy}" ;;
+        --install-shortcut) install_shortcut ;;
         --status)       show_info ;;
         --uninstall)    do_uninstall ;;
         --help|-h)
             cat << 'HELPEOF'
 sing-box 旁路由网关部署脚本 (Alpine Linux)
 
+快捷命令:
+  sb                             安装后可直接使用 (等价于 bash 本脚本)
+
 用法:
-  bash $0                       交互式菜单 (默认)
-  bash $0 --menu                交互式菜单
-  bash $0 --install             完整部署 (非交互, 核心+面板+服务+配置)
-  bash $0 --update-core         仅更新 sing-box 核心
-  bash $0 --update-panel       仅更新管理面板
+  sb                              交互式菜单 (推荐)
+  sb --install                    完整部署
+  sb --update-core                更新核心
+  sb --convert-apply <URL>        转换并应用订阅
+  sb --help                       查看帮助
+  bash $0                         交互式菜单 (默认)
+  bash $0 --menu                  交互式菜单
+  bash $0 --install               完整部署 (非交互, 核心+面板+服务+配置)
+  bash $0 --update-core           仅更新 sing-box 核心
+  bash $0 --update-panel          仅更新管理面板
   bash $0 --update-dashboard <name>  安装/更新仪表盘 (metacubexd/zashboard/yacd)
-  bash $0 --update-sub         更新所有订阅并合并节点
+  bash $0 --update-sub            更新所有订阅并合并节点
   bash $0 --convert <URL> [模板]  转换订阅为 sing-box JSON
   bash $0 --convert-apply <URL> [模板]  转换订阅并直接写入 config.json + 重启
                                   模板: tproxy / tun / mixed
-  bash $0 --status              查看当前配置与状态
-  bash $0 --uninstall          卸载 (交互式确认)
-  bash $0 --help               显示此帮助
+  bash $0 --install-shortcut      安装 sb 快捷命令到 /usr/local/bin/sb
+  bash $0 --status                查看当前配置与状态
+  bash $0 --uninstall             卸载 (交互式确认)
+  bash $0 --help                  显示此帮助
 
 菜单功能 (交互模式):
   1 完整安装  2 更新核心  3 更新面板  4 更新订阅  5 转换订阅(预览/应用)
   6 服务管理  7 配置网关  8 面板管理  9 查看信息  10 查看日志  11 卸载
+  12 安装快捷命令 sb
 
 模板说明:
   config-tproxy.json  tproxy 透明网关 (需 nftables 规则, 推荐旁路由)
