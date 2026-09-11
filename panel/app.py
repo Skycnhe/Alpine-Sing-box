@@ -969,7 +969,7 @@ def build_anti_leak_dns(proxy_domains=None):
     # 规则2: 广告域名 → DNS层拒绝
     rules.append({
         "rule_set": "geosite-category-ads-all",
-        "rcode": "REFUSED"
+        "action": "reject"
     })
 
     # 规则3: clash_mode 直连 → 直连DNS

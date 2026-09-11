@@ -267,9 +267,9 @@ install_configs() {
         info "创建默认配置 (tproxy 模式)..."
         need_regen=true
     else
-        # 检测旧格式: legacy DNS (address 字段) 或 _comment 字段
-        if grep -q '"_comment"\|"_usage"\|"address".*dns-query\|"address".*rcode' "$SB_CONFIG" 2>/dev/null; then
-            warn "检测到旧格式配置 (legacy DNS / 注释字段), 自动迁移到新格式..."
+        # 检测旧格式: legacy DNS (address 字段), _comment 字段, DNS rcode 规则
+        if grep -qE '"_comment"|"_usage"|"address".*dns-query|"address".*rcode|"rcode".*"(REFUSED|SUCCESS|success|refused)"|"independent_cache"' "$SB_CONFIG" 2>/dev/null; then
+            warn "检测到旧格式配置 (legacy DNS / 注释字段 / rcode 规则), 自动迁移到新格式..."
             cp "$SB_CONFIG" "${SB_CONFIG_BACKUP}.old-format"
             need_regen=true
         else
@@ -336,13 +336,17 @@ fix_config() {
 
     local need_fix=false
 
-    # 检测问题: _comment/_usage 字段, legacy DNS (address + dns-query/rcode)
+    # 检测问题: _comment/_usage 字段, legacy DNS (address + dns-query/rcode), DNS rcode 规则
     if grep -qE '"_(comment|usage)"' "$SB_CONFIG" 2>/dev/null; then
         warn "检测到注释字段 (_comment/_usage) — sing-box 会拒绝未知字段"
         need_fix=true
     fi
     if grep -qE '"address"\s*:\s*"(https?://|rcode://)' "$SB_CONFIG" 2>/dev/null; then
         warn "检测到 legacy DNS 格式 (address + dns-query/rcode) — sing-box 1.14.0 已移除"
+        need_fix=true
+    fi
+    if grep -qE '"rcode"\s*:\s*"(REFUSED|SUCCESS|success|refused)"' "$SB_CONFIG" 2>/dev/null; then
+        warn "检测到 DNS 规则中的 rcode 字段 — 已改为 action: reject"
         need_fix=true
     fi
     if grep -q '"independent_cache"' "$SB_CONFIG" 2>/dev/null; then
