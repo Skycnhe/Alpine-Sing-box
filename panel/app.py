@@ -138,8 +138,17 @@ def get_uptime():
 
 def get_clash_info():
     """通过 clash API 获取实时连接数"""
-    cfg = get_panel_config()
-    secret = cfg.get("clash_secret", "")
+    # 优先从 sing-box config.json 读取 secret (source of truth)
+    secret = ""
+    try:
+        with open(CONFIG_FILE) as f:
+            sb_cfg = json.load(f)
+        secret = sb_cfg.get("experimental", {}).get("clash_api", {}).get("secret", "")
+    except Exception:
+        pass
+    # 回退到 panel.json 手动配置
+    if not secret:
+        secret = get_panel_config().get("clash_secret", "")
     headers = {}
     if secret:
         headers["Authorization"] = f"Bearer {secret}"
@@ -2001,10 +2010,18 @@ def serve_dashboard(name, p="index.html"):
         try:
             with open(target, "r", encoding="utf-8") as f:
                 content = f.read()
-            # 注入一段提示脚本: 若未配置后端, 提示连接 :9090
+            # 读取后端密钥, 注入到页面供仪表盘自动填充
+            _secret = ""
+            try:
+                with open(CONFIG_FILE) as cf:
+                    _secret = json.load(cf).get("experimental", {}).get("clash_api", {}).get("secret", "")
+            except Exception:
+                pass
             inject = (
                 "<script>window.__SINGBOX_PANEL=1;"
-                "window.__CLASH_API_HINT=' Clash API 运行在 :9090, 首次使用请在仪表盘设置中填入后端地址';"
+                "window.__CLASH_API_HOST='http://'+location.hostname+':9090';"
+                f"window.__CLASH_API_SECRET={json.dumps(_secret)};"
+                "window.__CLASH_API_HINT='后端地址: '+window.__CLASH_API_HOST+'  密钥: "+(_secret or '(空)')+"';"
                 "</script>"
             )
             if "</head>" in content:

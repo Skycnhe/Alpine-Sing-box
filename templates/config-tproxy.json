@@ -216,7 +216,8 @@
     },
     "clash_api": {
       "external_controller": "0.0.0.0:9090",
-      "default_mode": "rule"
+      "default_mode": "rule",
+      "secret": "singbox-gateway"
     }
   }
 }
