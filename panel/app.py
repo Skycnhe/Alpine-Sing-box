@@ -946,8 +946,7 @@ def build_anti_leak_dns(proxy_domains=None):
         {
             "type": "udp",
             "tag": "direct-dns",
-            "server": "223.5.5.5",
-            "detour": "direct"
+            "server": "223.5.5.5"
         },
         {
             "type": "fakeip",

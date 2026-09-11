@@ -268,8 +268,8 @@ install_configs() {
         need_regen=true
     else
         # 检测旧格式: legacy DNS (address 字段), _comment 字段, DNS rcode 规则
-        if grep -qE '"_comment"|"_usage"|"address".*dns-query|"address".*rcode|"rcode".*"(REFUSED|SUCCESS|success|refused)"|"independent_cache"' "$SB_CONFIG" 2>/dev/null; then
-            warn "检测到旧格式配置 (legacy DNS / 注释字段 / rcode 规则), 自动迁移到新格式..."
+        if grep -qE '"_comment"|"_usage"|"address".*dns-query|"address".*rcode|"rcode".*"(REFUSED|SUCCESS|success|refused)"|"independent_cache"|"detour".*"direct"' "$SB_CONFIG" 2>/dev/null; then
+            warn "检测到旧格式配置 (legacy DNS / 注释字段 / rcode 规则 / 空 detour), 自动迁移到新格式..."
             cp "$SB_CONFIG" "${SB_CONFIG_BACKUP}.old-format"
             need_regen=true
         else
@@ -355,6 +355,10 @@ fix_config() {
     fi
     if grep -qE '"type"\s*:\s*"block"|"type"\s*:\s*"dns"' "$SB_CONFIG" 2>/dev/null; then
         warn "检测到 block/dns outbound — sing-box 1.14.0 已改为 route action"
+        need_fix=true
+    fi
+    if grep -qE '"detour"\s*:\s*"direct"' "$SB_CONFIG" 2>/dev/null; then
+        warn "检测到 DNS 服务器 detour:direct — sing-box 拒绝空直连 detour"
         need_fix=true
     fi
 
