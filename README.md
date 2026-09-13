@@ -4,15 +4,23 @@
 
 ## 一键安装
 
-在 Alpine Linux 上执行以下命令，全自动完成下载 + 部署 + 启动：
+> **推荐方式：** 在 Alpine Linux 的 root 终端中复制下面整行命令，即可自动下载代码、安装依赖、部署 sing-box、安装面板并启动服务。
 
 ```bash
-wget -qO- https://github.com/Skycnhe/Alpine-Sing-box/archive/refs/heads/Hk001.tar.gz | tar xz -C /tmp && cd /tmp/Alpine-Sing-box-Hk001 && bash sing-box-gateway-deploy.sh --install
+rm -rf /tmp/Alpine-Sing-box-Hk001 && wget -qO- https://github.com/Skycnhe/Alpine-Sing-box/archive/refs/heads/Hk001.tar.gz | tar xz -C /tmp && cd /tmp/Alpine-Sing-box-Hk001 && bash sing-box-gateway-deploy.sh --install
 ```
 
-> 如果系统已有 `curl`，也可用：
+一键命令执行内容：
+
+- 自动识别 CPU 架构和 libc 类型并下载对应 sing-box 核心
+- 自动安装 Alpine 所需依赖、OpenRC 服务和 nftables 规则
+- 自动安装 Flask Web 管理面板及内置仪表盘
+- 自动部署透明网关模板、DNS 防泄露和国内外分流规则
+- 自动安装 `sb` 快捷命令到 `/usr/local/bin/sb`
+
+> 如果系统已有 `curl`，也可使用：
 > ```bash
-> curl -fsSL https://github.com/Skycnhe/Alpine-Sing-box/archive/refs/heads/Hk001.tar.gz | tar xz -C /tmp && cd /tmp/Alpine-Sing-box-Hk001 && bash sing-box-gateway-deploy.sh --install
+> rm -rf /tmp/Alpine-Sing-box-Hk001 && curl -fsSL https://github.com/Skycnhe/Alpine-Sing-box/archive/refs/heads/Hk001.tar.gz | tar xz -C /tmp && cd /tmp/Alpine-Sing-box-Hk001 && bash sing-box-gateway-deploy.sh --install
 > ```
 
 部署完成后，脚本会自动安装 **`sb`** 快捷命令。之后直接输入 `sb` 即可打开管理菜单，无需再记脚本路径：
